@@ -4,10 +4,12 @@
 
 ## 0. 部署拓扑
 
+> **现状备注（2026-09 修订）**：下方是最初方案的拓扑，落地形态已变更——**所有服务都在 GPU 节点本地拉起**（`start_demo.sh` 一键启动，详见 `docs/ops_runbook.md`），CPU 节点只作浏览器入口转发（经 rtunnel 回连 127.0.0.1:2222，`-R` 推 web :20941、`-D` 推 MiniMax 出口 :17890），不再依赖 CPU→GPU 的 10008 `-L` 转发。实际端口：gateway :8100（`.env.deploy` 的 `PORT=8100`）、pi_agent :38082、4B :38090、omni 实例 18500+i。
+
 ```
 CPU 节点（本仓库）                          GPU 节点（127.0.0.1:10008 反向隧道）
 ├─ demo gateway  .venv  :8000              ├─ sglang-omni server × N（每卡 TP1，18500+i）
-├─ React 前端    vite preview :20941       ├─ pi_agent        :38080（decide/compact）
+├─ React 前端    vite preview :20941       ├─ pi_agent        :38082（decide/compact）
 └─ SenseVoice ASR / TTS（in-process，CPU） └─ Qwen3-4B sglang :38090（decide/compact 后端）
         │                                            ▲
         └── SSH 本地转发（ssh -fN -L ... -p 10008）──┘
@@ -88,7 +90,7 @@ SGLANG_OMNI_INPUT_QUEUE_CAPACITY=4
 SGLANG_OMNI_INPUT_DROP_WAIT_SECONDS=0.5
 SGLANG_OMNI_CONNECT_TIMEOUT_S=10
 SGLANG_OMNI_HEALTH_INTERVAL_S=10
-MEMORY_PI_URL=http://127.0.0.1:38080
+MEMORY_PI_URL=http://127.0.0.1:38082
 MEMORY_PI_DECIDE_TIMEOUT_S=8 / MEMORY_PI_COMPACT_TIMEOUT_S=120
 MEMORY_DECISION_MODE=hybrid
 MEMORY_ROLLOVER_PREFETCH_RATIO=0.6
@@ -100,7 +102,7 @@ MEMORY_SUMMARY_PROVIDER 增加 "pi"
 ### 3.2 CPU 节点环境
 
 - `.venv`：`python3 -m venv .venv && pip install -r requirements.txt`（**无代理直连**；torch 装 CPU wheel 省盘，funasr/SenseVoice CPU 可跑；如遇包拉取问题再逐个换源处理）。前端：`npm install && npm run build`。
-- SSH 转发（CPU 节点上）：`ssh -fN -L ... -p 10008 root@127.0.0.1`，把 sglang-omni 各端口（18500+i）、pi_agent 38080、4B 38090 映射到本地（已有转发则复用）。
+- ~~SSH 转发（CPU 节点上）~~【已废弃】原方案的 CPU→GPU `-L` 转发（`ssh -fN -L ... -p 10008`）挂在 rtunnel 上、rtunnel 一断就死，已废弃。现行形态：所有服务在 GPU 节点本地拉起（`start_demo.sh`），只经 rtunnel 回连（127.0.0.1:2222）向 CPU 推 `-R 20941` 入口转发；pi_agent :38082、4B :38090、omni 18500+i 均为 GPU 节点本地端口。
 - `.env.deploy` 样例：`VLM_DEPLOY=sglang_omni` / `SGLANG_OMNI_URLS=...` / `OFFLINE_PROVIDER=none` / `MEMORY_ENABLED=1` / `MEMORY_SUMMARY_PROVIDER=pi` / `DEMO_SKIP_GPU=1`（CPU 节点跳过 GPU 探测）。
 
 ### 3.3 GPU 节点启动脚本（新建 `scripts/gpu/`）

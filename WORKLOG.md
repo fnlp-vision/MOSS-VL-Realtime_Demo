@@ -1,6 +1,7 @@
 # WORKLOG
 
-- **Repo**: /inspire/hdd/project/video-understanding/public/personal/chwang/live/MOSS-VL-Realtime_Demo_App
+- **Repo**: /inspire/hdd/project/video-understanding/public/personal/yxchen/mossvl_realtime_inference
+- **Note**: 本日志条目继承自原始 Demo 仓库（chwang/live/MOSS-VL-Realtime_Demo_App），迁移时随代码一并带入；其中的工作状态描述以源仓库当时为准。
 - **Date range**: 2026-08-17 ~ 2026-08-17
 - **Total logs**: 1
 - **Last updated**: 2026-08-17
@@ -21,4 +22,4 @@
 4. **Deploy docs**
    1. `.env.deploy.example` gained a commented MiniMax config block (key, documented host vs. mirror gotcha, model/voice/sample-rate, proxy, warmup) plus the new `ELEVENLABS_STABILITY` knob.
 
-All of the above is uncommitted working-tree work (no commits today); the last commit is `afab88d` from 2026-08-16.
+（原日志称当日工作未提交、last commit 为 `afab88d`——那是源仓库 2026-08-17 时的状态；在本仓库中，上述工作已包含于 Initial commit `7682620`。）

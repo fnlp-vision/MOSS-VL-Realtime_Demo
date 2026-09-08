@@ -6,7 +6,7 @@
 # 不依赖 CPU→GPU 的 10008 反向隧道（那个挂在 rtunnel 上，rtunnel 一断就死）。
 #
 # 启动顺序（MiniMax 出口在 gateway 之前，保证 minimax lane 探测就绪）：
-#   1. sglang-omni 推理实例   (本地, 默认 GPUS=0,1 → :18500/:18501, 全部健康则跳过)
+#   1. sglang-omni 推理实例   (本地, 布局读 deploy.conf, 默认 OMNI_GPUS=0 → 1 实例 :18500, 全部健康则跳过)
 #   2. pi_agent + 4B 后端     (本地, :38082 / :38090, 已健康则跳过)
 #   3. MiniMax 出口        (ssh -fN -D 17890, 先于 gateway, 保证 minimax lane 探测就绪)
 #   4. demo.sh up             (本地, gateway :8100 + TTS sidecar + web :20941)
