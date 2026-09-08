@@ -389,6 +389,10 @@ export function useSession(callbacks: UseSessionCallbacks) {
       cb.current.onLog('Session expired on the server.', 'red');
       setError('session expired');
       teardown(false);
+    } else if (state === 'busy') {
+      cb.current.onLog('Server is at capacity — not reconnecting.', 'red');
+      setError('server at capacity — please retry shortly');
+      teardown(false);
     } else if (state === 'superseded') {
       cb.current.onLog('Session was taken over by another tab.', 'red');
       teardown(false);

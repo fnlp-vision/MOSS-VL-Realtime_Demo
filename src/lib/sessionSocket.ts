@@ -8,7 +8,8 @@
 // never replayed) — we track max(seq) and reconnect with ?last_seq=N so the
 // server replays only what we missed. Close code 4000 means another socket
 // superseded this one (stop retrying); 4404 means the session is gone
-// (the caller must create a new one over REST).
+// (the caller must create a new one over REST); 1013 means the server
+// refused for capacity (stop retrying — an immediate retry lands the same).
 
 export const TAG_MIC_PCM = 0x01;
 export const TAG_VIDEO_JPEG = 0x02;
@@ -21,7 +22,7 @@ export interface ServerEvent {
   [key: string]: unknown;
 }
 
-export type SocketState = 'connecting' | 'open' | 'reconnecting' | 'closed' | 'superseded' | 'gone';
+export type SocketState = 'connecting' | 'open' | 'reconnecting' | 'closed' | 'superseded' | 'gone' | 'busy';
 
 export interface SessionSocketHandlers {
   onEvent: (ev: ServerEvent) => void;
@@ -173,6 +174,7 @@ export class SessionSocket {
       if (this.closedByUser) return this.setState('closed');
       if (ev.code === 4000) return this.setState('superseded');
       if (ev.code === 4404) return this.setState('gone');
+      if (ev.code === 1013) return this.setState('busy');
       const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** this.retries++);
       this.setState('reconnecting');
       this.reconnectTimer = setTimeout(() => this.open(), delay);

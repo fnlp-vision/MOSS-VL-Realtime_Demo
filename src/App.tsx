@@ -2245,9 +2245,17 @@ export default function App() {
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         if (!hadPreview) stopWebMedia(); // keep a user-opened preview alive
-        setCaptionsText(
-          (language === 'en' ? 'Connection failed: ' : '连接失败：') + message,
-        );
+        addLog(language === 'en' ? 'Connection failed: ' + message : '连接失败：' + message, 'red');
+        // pin the failure in the transcript as a system chip: the session.error
+        // effect re-stamps the caption with this exact '⚠' text, so the dedup
+        // check below hides the (transient) caption twin — the chip is what
+        // stays visible until the next call
+        const failureText = `⚠ ${message}`;
+        setStreamConversation((prev) => [
+          ...prev,
+          { sender: 'ai', system: true, text: failureText, time: getFormattedTime() },
+        ]);
+        setCaptionsText(failureText);
         return;
       }
       addLog(language === 'en' ? 'Realtime stream active.' : '实时连线建立成功。', 'live');
@@ -5190,14 +5198,16 @@ export default function App() {
                     </div>
                     )
                   ))}
-                  {captionsText && (streamConnected || subtitleDemoActive) &&
+                  {captionsText && (streamConnected || subtitleDemoActive || session.error) &&
                     streamConversation[streamConversation.length - 1]?.text !== captionsText && (
                     /* the stage subtitle bar is retired — the model's current
                        sentence reveals HERE as a provisional tail bubble;
                        each sentence's committed bubble replaces it as it
                        closes. (The caption lingers on a just-closed sentence
                        until the next one starts — the last-entry comparison
-                       hides that duplicate beat.) */
+                       hides that duplicate beat.) A fatal session.error also
+                       reveals here — it lands precisely when the connection
+                       (and with it the normal gate) is gone. */
                     <div className={`log-entry ${streamSpeaker} caption-pending`}>
                       <div className="log-entry-meta">
                         <span className="log-entry-speaker">
