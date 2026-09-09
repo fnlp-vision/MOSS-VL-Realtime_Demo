@@ -310,14 +310,15 @@ def _load_template_owner(model_path: str) -> Any:
 def _resolve_image_payload(payload: str) -> str:
     """Chat image payload → something sglang's load_image accepts.
 
-    CAS handle → blob BYTES as base64 (same as the online pool's
-    _resolve_media_handles): sglang's load_image picks its file-path branch by
-    filename EXTENSION, and extension-less CAS blob paths fall through to the
-    raw-base64 branch and explode ("Non-base64 digit found"). Images are small
-    enough to ride the JSON body. data-URL / raw base64 pass through (sglang
-    decodes both natively). Videos are different — see _resolve_video_payload.
+    CAS handles and raw base64 become MIME-qualified data URLs. Bare JPEG
+    base64 starts with /9j/, which some sglang loaders interpret as an
+    absolute file path. Explicit data URLs avoid that ambiguity without
+    re-encoding the image. Existing data URLs pass through unchanged.
     """
     import base64
+    from io import BytesIO
+
+    from PIL import Image
 
     from ....persistence.media import normalize_hash, resolve_blob_path
 
@@ -329,8 +330,15 @@ def _resolve_image_payload(payload: str) -> str:
         if path is None:
             raise ValueError(f"unknown image media: {s[:19]}…")
         with open(path, "rb") as f:
-            return base64.b64encode(f.read()).decode("ascii")
-    return s  # raw base64
+            data = f.read()
+    else:
+        data = base64.b64decode(s, validate=True)
+    # Read only the image header to identify its MIME type; keep bytes intact.
+    with Image.open(BytesIO(data)) as image:
+        mime = Image.MIME.get(image.format)
+    if not mime or not mime.startswith("image/"):
+        raise ValueError("unsupported image format")
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 
 def _resolve_video_payload(payload: str) -> str:

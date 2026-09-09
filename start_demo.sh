@@ -59,7 +59,7 @@ else
   echo "SGLANG_OMNI_URLS=$omni_urls" >> "$REPO/.env.deploy"
 fi
 
-healthy() { curl -s --noproxy '*' --max-time 3 "http://127.0.0.1:$1/health" 2>/dev/null | grep -q '"status": *"healthy"\|"ok": *true'; }
+healthy() { curl -sf --noproxy '*' --max-time 3 "http://127.0.0.1:$1/health" 2>/dev/null | grep -q '"status": *"healthy"\|"ok": *true'; }
 
 echo "==> [1/5] sglang-omni 推理实例 ($instances 实例: :$port_base..:$port_last, TP_SIZE=$TP_SIZE)"
 all_healthy=1
@@ -77,30 +77,32 @@ else
 fi
 
 echo "==> [2/5] pi_agent + 4B decide/compact 后端 (4B → GPU ${DECIDE_LLM_GPU:-1})"
-if [ "${FORCE_PI:-0}" != "1" ] && healthy 38082 && curl -s --noproxy '*' --max-time 3 http://127.0.0.1:38090/health >/dev/null 2>&1; then
-  echo "      :38082 / :38090 已 healthy，跳过（FORCE_PI=1 可强制重启）"
-else
-  _PI_ON_GPU=1 START_4B=${START_4B:-1} \
-    DECIDE_LLM_GPU="${DECIDE_LLM_GPU:-1}" DECIDE_LLM_MEM_FRAC="${DECIDE_LLM_MEM_FRAC:-0.8}" \
-    bash "$REPO/scripts/gpu/start_pi_agent.sh"
-fi
+_PI_ON_GPU=1 START_4B=${START_4B:-1} FORCE_PI=${FORCE_PI:-0} \
+  bash "$REPO/scripts/gpu/start_pi_agent.sh"
 
-# 转发清理：按 comm=ssh + 转发特征精确匹配，不误伤
-kill_stale_ssh() { # $@ = 匹配特征（如 "-R" "127.0.0.1:20941:"）
-  local spec1="$1" spec2="$2" pids pid
-  pids="$(ps -ww -eo pid=,comm=,args= | awk -v s1="$spec1" -v s2="$spec2" '$2 == "ssh" && index($0, s1) && index($0, s2) {print $1}')"
-  for pid in $pids; do kill "$pid" 2>/dev/null && echo "      清掉旧转发 pid $pid" || true; done
+# 转发重建：按命令行里的转发特征（方向+端口）找到占坑的旧 ssh 客户端杀掉，
+# 不依赖 MOSS_DEPLOY_ROLE 标记——无标记的历史/手动进程占着端口也必须能换掉。
+# 只匹配 comm=ssh，不会误伤包含同样文本的其他进程（如本脚本自身）。
+kill_stale_ssh() { # $1=方向特征（"-D"/"-R"） $2=端口特征（如 "127.0.0.1:17890"）
+  local pids pid
+  pids="$(ps -ww -eo pid=,comm=,args= | awk -v s1="$1" -v s2="$2" \
+    '$2 == "ssh" && index($0, s1) && index($0, s2) {print $1}')"
+  for pid in $pids; do
+    kill "$pid" 2>/dev/null && echo "      清掉旧转发 pid $pid" || true
+  done
   [ -n "$pids" ] && sleep 1
-  return 0  # 没有残留也是正常路径，不能让 set -e 在这里静默退出
+  return 0
 }
 
 echo "==> [3/5] MiniMax 云 TTS 出口 (GPU 本地 SOCKS5 :$MM_SOCKS_PORT，经 CPU 直连)"
 # 必须先于 demo.sh up：gateway 启动时用 MINIMAX_PROXY 探测 minimax  lane，
 # 转发不在则 lane 卡在 not-ready，前端选 minimax 会静默回落本地 nano
 kill_stale_ssh "-D" "127.0.0.1:$MM_SOCKS_PORT"
-if ssh -fN -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+if MOSS_DEPLOY_REPO="$REPO" MOSS_DEPLOY_ROLE=ssh-socks \
+  ssh -fN -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
   -D "127.0.0.1:$MM_SOCKS_PORT" root@127.0.0.1 -p 2222; then
-  mm_code=$(curl -s --noproxy '*' --max-time 8 -x "socks5h://127.0.0.1:$MM_SOCKS_PORT" \
+  # 注意不能加 --noproxy '*'：它会把 -x 指定的代理也禁掉，导致探测走直连误报不通
+  mm_code=$(curl -s --max-time 8 -x "socks5h://127.0.0.1:$MM_SOCKS_PORT" \
     -o /dev/null -w '%{http_code}' https://api.minimaxi.com/v1/t2a_v2 2>/dev/null || true)
   case "$mm_code" in
     40*) echo "      MiniMax 链路 OK (HTTP $mm_code)" ;;
@@ -116,8 +118,9 @@ cd "$REPO" && bash scripts/deploy/demo.sh up
 echo "==> [5/5] 浏览器入口转发（经 rtunnel 回连 127.0.0.1:2222）"
 # CPU 127.0.0.1:CPU_PORT → GPU 127.0.0.1:WEB_PORT
 # （转发失败不致命——端口被占只影响入口，服务本体已就绪，不能拖垮整个脚本）
-kill_stale_ssh "-R" "127.0.0.1:$CPU_PORT:127.0.0.1:$WEB_PORT"
-if ssh -fN -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+kill_stale_ssh "-R" "127.0.0.1:$CPU_PORT:"
+if MOSS_DEPLOY_REPO="$REPO" MOSS_DEPLOY_ROLE=ssh-browser \
+  ssh -fN -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
   -R "127.0.0.1:$CPU_PORT:127.0.0.1:$WEB_PORT" root@127.0.0.1 -p 2222; then
   echo "      入口转发 OK: CPU :$CPU_PORT → GPU :$WEB_PORT"
 else

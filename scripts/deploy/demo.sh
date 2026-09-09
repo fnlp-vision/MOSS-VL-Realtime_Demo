@@ -95,8 +95,8 @@ fwd_env() {
 win_cmd() { # $1 window name, $2 script
   # rotating_tee replaces `tee -a`: real 32 MiB × 5 rotation, still echoes to
   # the tmux pane (no --quiet), and outlives a respawn-kill until stdin EOF
-  printf 'env %sbash %q 2>&1 | %q %q %q' \
-    "$(fwd_env)" "$REPO/scripts/deploy/$2" \
+  printf 'env %sMOSS_DEPLOY_REPO=%q MOSS_DEPLOY_ROLE=demo bash %q 2>&1 | %q %q %q' \
+    "$(fwd_env)" "$REPO" "$REPO/scripts/deploy/$2" \
     "$PYBIN" "$REPO/scripts/deploy/rotating_tee.py" "$LOG_ROOT/stdout/$1/console.log"
 }
 
@@ -165,45 +165,27 @@ warn_tunnels() {
 }
 
 down() {
-  # current layout + every legacy session name from older script generations
+  # Request graceful API shutdown before tmux delivers SIGHUP. After the
+  # bounded TERM/KILL sequence, continue startup even if exit is unconfirmed.
+  "$PYBIN" "$REPO/scripts/deploy/stop_backend.py" --repo "$REPO" || return 1
+  # A session name alone is not ownership. Leave unmarked/foreign sessions.
   local s
   for s in "$SES" moss_tts moss_api moss_web moss_build; do
+    [ "$(tmux show-option -v -t "$s" @moss_repo 2>/dev/null || true)" = "$REPO" ] || continue
     tmux kill-session -t "$s" 2>/dev/null && echo "killed tmux session: $s" || true
   done
-  # The backend reaps its TTS sidecar pool + VLM workers in lifespan shutdown,
-  # but a HUP-killed uvicorn skips that and orphans them (the supervisors would
-  # adopt healthy orphans on the next `up`, but down must mean DOWN).
-  local tport tpid
-  for tport in $(seq "${TTS_PORT:-18100}" $(( ${TTS_PORT:-18100} + 7 ))); do
-    tpid="$(ss -tlnp 2>/dev/null | grep ":$tport " | grep -oP 'pid=\K[0-9]+' | head -1 || true)"
-    if [ -n "$tpid" ]; then
-      kill "$tpid" 2>/dev/null && echo "killed orphaned tts sidecar :$tport (pid $tpid)" || true
-    fi
-  done
-  pkill -f 'server\.vlm_worker' 2>/dev/null && echo "killed orphaned vlm workers" || true
-  # offline sglang sidecars: port-scoped ONLY (this is a shared box — other
-  # users run their own sglang servers; never pkill by name)
-  local sport spid
-  for sport in $(seq "${SGLANG_BASE_PORT:-30800}" $(( ${SGLANG_BASE_PORT:-30800} + 7 ))); do
-    spid="$(ss -tlnp 2>/dev/null | grep ":$sport " | grep -oP 'pid=\K[0-9]+' | head -1 || true)"
-    if [ -n "$spid" ]; then
-      kill "$spid" 2>/dev/null && echo "killed orphaned sglang sidecar :$sport (pid $spid)" || true
-    fi
-  done
-  # gateways/vite that escaped tmux (nohup previews, orphaned uvicorns) keep
-  # serving STALE code + proxy targets — down must take those too (this repo
-  # only; see stray_pids)
-  local pid cmd
-  for pid in $(stray_pids); do
-    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-120)"
-    kill "$pid" 2>/dev/null && echo "killed stray (this repo): pid $pid  $cmd" || true
-  done
+  "$PYBIN" "$REPO/scripts/deploy/stop_backend.py" --repo "$REPO" --role demo || return 1
+  echo "Unmarked legacy sidecars/sessions are not stopped automatically; inspect with doctor."
   warn_tunnels
 }
 
 up() {
   gpu_preflight
   down
+  if tmux has-session -t "$SES" 2>/dev/null; then
+    echo "FATAL: tmux session $SES is not owned by this checkout; set DEMO_SESSION to an unused name." >&2
+    return 1
+  fi
   prep_logs
   # vLLM-Omni's MOSS codec loader needs the conditional-Identity projection fix
   # or MOSS-TTS-Realtime dies at weight load (missing=6). Idempotent, and a pip
@@ -212,6 +194,7 @@ up() {
     "$REPO/.venv-vllm/bin/python" "$REPO/scripts/patch_vllm_omni_moss_codec.py" || true
   fi
   tmux new-session  -d -s "$SES" -n api "$(win_cmd api run_backend.sh)"
+  tmux set-option -t "$SES" @moss_repo "$REPO"
   tmux new-window   -t "$SES" -n web "$(win_cmd web run_web.sh)"
   echo "[1/3] api starting on :$API_PORT (backend spawns+gates its own TTS sidecar)"
 
@@ -269,11 +252,22 @@ up() {
 restart_one() { # $1 = api|web
   local w="$1"
   case "$w" in api|web) ;; *) echo "restart what? api|web"; exit 2 ;; esac
+  tmux has-session -t "$SES" 2>/dev/null || { echo "stack is down — use '$0 up'"; exit 1; }
+  [ "$(tmux show-option -v -t "$SES" @moss_repo 2>/dev/null || true)" = "$REPO" ] \
+    || { echo "FATAL: tmux session $SES is unmarked or belongs to another checkout" >&2; return 1; }
+  if [ "$w" = api ]; then
+    "$PYBIN" "$REPO/scripts/deploy/stop_backend.py" --repo "$REPO" --port "$API_PORT" || return 1
+  fi
   if tmux list-windows -t "$SES" -F '#W' 2>/dev/null | grep -qx "$w"; then
     tmux respawn-window -k -t "$SES:$w" "$(win_cmd "$w" "run_${w/api/backend}.sh")"
   else
-    tmux has-session -t "$SES" 2>/dev/null || { echo "stack is down — use '$0 up'"; exit 1; }
-    tmux new-window -t "$SES" -n "$w" "$(win_cmd "$w" "run_${w/api/backend}.sh")"
+    # Graceful exit can remove the last window and its tmux session.
+    if tmux has-session -t "$SES" 2>/dev/null; then
+      tmux new-window -t "$SES" -n "$w" "$(win_cmd "$w" "run_${w/api/backend}.sh")"
+    else
+      tmux new-session -d -s "$SES" -n "$w" "$(win_cmd "$w" "run_${w/api/backend}.sh")"
+      tmux set-option -t "$SES" @moss_repo "$REPO"
+    fi
   fi
   echo "respawned: $w (log $LOG_ROOT/stdout/$w/console.log)"
 }

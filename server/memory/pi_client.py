@@ -2,20 +2,21 @@
 
 The gateway calls pi_agent for two LLM jobs: `/decide` (should this turn
 retrieve memory at all) and `/compact` (compress the rollover journal into
-{summary, pins}). stdlib-only (urlopen) — no new dependency. Every failure
+{summary, pins}). Uses the gateway's existing aiohttp dependency. Every failure
 mode (timeout, non-200, bad payload) returns None so the caller degrades to
 the local-vector / verbatim-tail behavior without disturbing the turn, and is
 logged at WARNING level throttled per endpoint (60s) to avoid per-turn spam.
 """
 from __future__ import annotations
 
-import json
+import asyncio
+import math
 import socket
 import time
 from typing import Any, Dict, Optional
-from urllib.error import URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+
+import aiohttp
 
 from ..config import Settings
 from ..logging_conf import get_logger
@@ -38,36 +39,53 @@ def _warn_throttled(url: str, message: str, *args: Any) -> None:
 
 
 def _post_json(url: str, payload: Dict[str, Any], timeout: float) -> Optional[Dict[str, Any]]:
-    """POST JSON with up to 3 attempts (timeout/connection/5xx retry, 4xx hard-fail)."""
-    last_error: Optional[str] = None
-    for attempt in range(_MAX_ATTEMPTS):
-        request = Request(
-            url,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=timeout) as response:
-                status = int(response.status)
-                if 200 <= status < 300:
-                    body = json.loads(response.read().decode("utf-8"))
-                    if isinstance(body, dict):
-                        return body
-                    last_error = "non-object JSON payload"
-                    _warn_throttled(url, "%s (no retry)", last_error)
-                    return None  # 格式错误重试无意义
-                last_error = f"HTTP {status}"
-                if 400 <= status < 500:
-                    _warn_throttled(url, "%s (no retry)", last_error)
-                    return None  # 4xx 是请求问题，重试无意义
-        except (OSError, URLError, ValueError) as exc:
-            last_error = str(exc)
-        if attempt < _MAX_ATTEMPTS - 1:
-            log.info("pi_agent call %s attempt %d/%d failed (%s); retrying",
-                     url, attempt + 1, _MAX_ATTEMPTS, last_error)
-            time.sleep(_BACKOFF_S[attempt])
-    _warn_throttled(url, "%s (exhausted %d attempts)", last_error, _MAX_ATTEMPTS)
+    """Blocking/off-loop API; timeout covers connect, body, all attempts and backoff."""
+    if not math.isfinite(timeout) or timeout <= 0:
+        _warn_throttled(url, "invalid total timeout")
+        return None
+    return asyncio.run(_post_json_async(url, payload, timeout))
+
+
+async def _post_json_async(url: str, payload: Dict[str, Any], timeout: float) -> Optional[Dict[str, Any]]:
+    deadline = time.monotonic() + timeout
+    last_error = "deadline exceeded"
+    try:
+        async with asyncio.timeout(timeout):
+            async with aiohttp.ClientSession(trust_env=False) as session:
+                for attempt in range(_MAX_ATTEMPTS):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        async with session.post(url, json=payload,
+                                headers={"X-Memory-Timeout-Ms": str(max(1, int(remaining * 1000)))},
+                                timeout=aiohttp.ClientTimeout(total=remaining)) as response:
+                            if 200 <= response.status < 300:
+                                try:
+                                    body = await response.json(content_type=None)
+                                except ValueError:
+                                    _warn_throttled(url, "invalid JSON (no retry)")
+                                    return None
+                                if isinstance(body, dict):
+                                    return body
+                                _warn_throttled(url, "non-object JSON (no retry)")
+                                return None
+                            last_error = f"HTTP {response.status}"
+                            if 400 <= response.status < 500:
+                                _warn_throttled(url, "%s (no retry)", last_error)
+                                return None
+                            if response.status not in (500, 502, 503, 504):
+                                return None
+                    except (aiohttp.ClientError, OSError, TimeoutError) as exc:
+                        last_error = str(exc) or "deadline exceeded"
+                    if attempt < _MAX_ATTEMPTS - 1:
+                        delay = _BACKOFF_S[attempt]
+                        if deadline - time.monotonic() <= delay:
+                            break
+                        await asyncio.sleep(delay)
+    except TimeoutError:
+        last_error = "total deadline exceeded"
+    _warn_throttled(url, "%s (bounded attempts exhausted)", last_error)
     return None
 
 
@@ -88,7 +106,7 @@ class PiAgentClient:
         """Ask pi_agent whether to retrieve; None means degrade to local gating."""
         if not self._url:
             return None
-        return _post_json(
+        result = _post_json(
             f"{self._url}/decide",
             {
                 "conversation_id": str(conversation_id),
@@ -97,6 +115,13 @@ class PiAgentClient:
             },
             float(self._settings.memory_pi_decide_timeout_s),
         )
+        if result is not None and (type(result.get("retrieve")) is not bool
+                or (result.get("query") is not None and not isinstance(result["query"], str))
+                or (isinstance(result.get("query"), str) and len(result["query"]) > 512)
+                or not isinstance(result.get("reason"), str) or len(result["reason"]) > 512):
+            _warn_throttled(f"{self._url}/decide", "invalid decision schema (no retry)")
+            return None
+        return result
 
     def compact(self, conversation_id: str, journal: str) -> Optional[Dict[str, Any]]:
         """Ask pi_agent to compress the journal; None means caller must fall back."""
@@ -104,7 +129,8 @@ class PiAgentClient:
             return None
         return _post_json(
             f"{self._url}/compact",
-            {"conversation_id": str(conversation_id), "journal": journal},
+            {"conversation_id": str(conversation_id), "journal": journal,
+             "summary_max_tokens": min(200, max(16, int(self._settings.memory_summary_max_tokens)))},
             float(self._settings.memory_pi_compact_timeout_s),
         )
 

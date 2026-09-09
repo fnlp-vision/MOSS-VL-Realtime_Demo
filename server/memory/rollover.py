@@ -16,7 +16,7 @@ The new prefill is ONE role:system message at position 0 — base prompt /
 recall-format declaration / pinned / verbatim-hold / summary / handle line —
 followed by the last `memory_rollover_tail_turns` turns verbatim as real
 user/assistant tail messages. The summary is RE-DERIVED from the full raw
-journal each rollover (never summary-of-summary) — on the pi_agent sidecar
+journal each rollover (bounded QA chunks are merged within that job) — on the pi_agent sidecar
 (provider "pi": /compact → {summary, pins}, pins join the pinned layer) or on
 the offline sglang plane (provider "offline"); any other provider or an
 absent/unloaded/failing backend degrades to verbatim-tail-only with NO error
@@ -49,7 +49,7 @@ _BUDGET_TAIL = 700           # the verbatim recent-turns tail
 # base prompt + recall declaration + handle line are fixed scaffolding and are
 # estimated from their real text, not budgeted.
 
-_JOURNAL_LIMIT = 2000        # full raw journal cap (utterance rows)
+_JOURNAL_LIMIT = -1          # all raw utterances; never silently omit older history
 _TAIL_MSG_OVERHEAD = 8       # chat-template scaffolding per tail message (est.)
 
 # verbatim-hold extraction (lexical, design §6 — no model):
@@ -184,11 +184,17 @@ class RolloverManager:
         rollover fires; a still-running one gets a bounded join (30s), and a
         failed/empty one falls through to the synchronous path unchanged.
         """
-        cached = self._take_prefetch()
-        if cached is not None:
-            (journal, pinned, tail), summary, pins = cached
-            return self._assemble(summary, pins=pins, collected=(journal, pinned, tail))
+        cached = await asyncio.to_thread(self._take_prefetch)
         journal, pinned, tail = await asyncio.to_thread(self._collect)
+        if cached is not None:
+            (old_journal, _, _), summary, pins = cached
+            try:
+                has_extra = bool(self._journal_extra and self._journal_extra())
+            except Exception:
+                has_extra = True
+            if old_journal == journal and not has_extra:
+                return self._assemble(summary, pins=pins, collected=(journal, pinned, tail))
+            log.info("rollover compact prefetch stale; rebuilding from current journal")
         summary, pins = await self._summarize_full(journal)
         return self._assemble(summary, pins=pins, collected=(journal, pinned, tail))
 
@@ -279,11 +285,17 @@ class RolloverManager:
 
         pinned_lines, pinned_ids = self._budget_lines(pinned, _BUDGET_PINNED)
         if pins:
-            # pi_agent /compact pins: the compactor's explicit keep-list —
-            # high-priority verbatim lines AHEAD of the user's store pins, and
-            # not subject to the layer budget (board parity)
-            pins_lines = [str(p).replace("\n", " ").strip() for p in pins if str(p).strip()]
-            pinned_lines = pins_lines + pinned_lines
+            # Explicit user pins take priority. Generated pins share the same
+            # bounded layer rather than bypassing the prefix budget.
+            used = sum(inject_mod.estimate_tokens(line) for line in pinned_lines)
+            for pin in pins:
+                if not isinstance(pin, str):
+                    continue
+                line = inject_mod.sanitize_model_text(pin).replace("\n", " ").strip()
+                cost = inject_mod.estimate_tokens(line)
+                if line and used + cost <= _BUDGET_PINNED:
+                    pinned_lines.append(line)
+                    used += cost
         if pinned_lines:
             header = "置顶记忆 / Pinned:" if zh else "Pinned memories:"
             sections.append(header + "\n" + "\n".join(pinned_lines))
@@ -342,20 +354,15 @@ class RolloverManager:
 
     def _journal_lines(self, journal: Sequence[MemoryItem]) -> List[str]:
         """Serialize the raw journal for pi_agent /compact: sanitized (this is
-        user-authored text reaching an LLM), token-capped, with the session's
+        user-authored text reaching an LLM), with the session's
         uncommitted (interrupted) turns appended as trailing context."""
         lines: List[str] = []
-        used = 0
         for item in journal:
             text = inject_mod.sanitize_model_text(item.text).replace("\n", " ").strip()
             if not text:
                 continue
             who = "用户" if item.role == "user" else "助手"
             line = f"{who}: {text}"
-            used += inject_mod.estimate_tokens(line)
-            if used > 3000:  # ~2x the design prefix; plenty for a 200-token summary
-                lines.append("…")
-                break
             lines.append(line)
         if self._journal_extra is not None:
             try:
@@ -384,9 +391,16 @@ class RolloverManager:
             return None, []
         if response is None:
             return None, []
-        summary = inject_mod.sanitize_model_text(str(response.get("summary") or "")).strip()
+        if (not isinstance(response, dict) or not isinstance(response.get("summary"), str)
+                or len(response["summary"]) > 200 or not isinstance(response.get("pins"), list)
+                or len(response["pins"]) > 16
+                or any(not isinstance(p, str) or not p.strip() or len(p) > 256
+                       for p in response["pins"])):
+            log.warning("pi_agent /compact returned invalid or oversized output; using verbatim tail")
+            return None, []
+        summary = inject_mod.sanitize_model_text(response["summary"]).strip()
         pins = [p for p in
-                (inject_mod.sanitize_model_text(str(pin)).replace("\n", " ").strip()
+                (inject_mod.sanitize_model_text(pin).replace("\n", " ").strip()
                  for pin in (response.get("pins") or [])) if p]
         if not summary:
             log.warning("pi_agent /compact returned an empty summary; using verbatim tail")
@@ -417,13 +431,14 @@ class RolloverManager:
             if existing is not None and existing.status in ("running", "ready"):
                 return False
             self._prefetch = _Prefetch()
+            prefetch = self._prefetch
         thread = threading.Thread(
-            target=self._prefetch_worker, daemon=True,
+            target=self._prefetch_worker, args=(prefetch,), daemon=True,
             name=f"memory-prefetch-{self.conversation_id[-6:]}")
         thread.start()
         return True
 
-    def _prefetch_worker(self) -> None:
+    def _prefetch_worker(self, prefetch: _Prefetch) -> None:
         try:
             collected = self._collect()
             summary, pins = self._summarize_pi(collected[0])
@@ -433,9 +448,8 @@ class RolloverManager:
             log.warning("rollover compact prefetch failed for %s: %s", self.conversation_id, exc)
             result, status = None, "error"
         with self._prefetch_lock:
-            prefetch = self._prefetch
             # a consumed/replaced prefetch discards this result silently
-            if prefetch is not None and prefetch.status == "running":
+            if self._prefetch is prefetch and prefetch.status == "running":
                 prefetch.status = status
                 prefetch.result = result
                 prefetch.done.set()
@@ -466,8 +480,8 @@ class RolloverManager:
     # ------------------------------------------------------------------ summary (offline plane)
 
     async def _summarize(self, journal: Sequence[MemoryItem]) -> Optional[str]:
-        """One summary re-derived from the FULL raw journal, every rollover
-        (never summary-of-summary, design §6). Any provider/plane/generation
+        """Summarize all raw QA blocks, merging chunks within this rollover.
+        Any provider/plane/generation
         problem returns None → verbatim-tail-only, never an exception."""
         if not self._summary_configured():
             return None
@@ -479,37 +493,45 @@ class RolloverManager:
                 return None
         except Exception:  # noqa: BLE001
             return None
-        # journal text is user-authored: sanitize before it reaches ANY model
-        # (split_special_tokens=False makes special-token strings live control
-        # tokens), and cap the prompt so a huge journal can't stall the sidecar
-        lines = []
-        used = 0
-        for item in journal:
-            text = inject_mod.sanitize_model_text(item.text).replace("\n", " ").strip()
-            if not text:
-                continue
-            who = "用户" if item.role == "user" else "助手"
-            line = f"{who}: {text}"
-            used += inject_mod.estimate_tokens(line)
-            if used > 3000:  # ~2x the design prefix; plenty for a 200-token summary
-                lines.append("…")
-                break
-            lines.append(line)
+        lines = self._journal_lines(journal)
         if not lines:
             return None
-        req = ChatRequest(
-            messages=[ChatMessage(role="user", content=_SUMMARY_PROMPT.format(
-                journal="\n".join(lines)))],
-            params=GenerationParams(
-                max_new_tokens=max(16, int(self.settings.memory_summary_max_tokens)),
-                temperature=0.0))
+        blocks: List[str] = []
+        for line in lines:
+            if line.startswith("用户:") or not blocks:
+                blocks.append(line)
+            else:
+                blocks[-1] += "\n" + line
+        chunks: List[str] = []
+        for block in blocks:
+            if inject_mod.estimate_tokens(block) > 2500:
+                log.warning("offline compact QA block exceeds budget; using verbatim tail")
+                return None
+            if chunks and inject_mod.estimate_tokens(chunks[-1] + "\n" + block) <= 2500:
+                chunks[-1] += "\n" + block
+            else:
+                chunks.append(block)
+        if len(chunks) > 32:
+            log.warning("offline compact exceeds 32 chunks; using verbatim tail")
+            return None
+        text = ""
         try:
             async with self._semaphore:
-                parts: List[str] = []
-                async for delta in plane.generate_stream(req):
-                    parts.append(str(delta))
+                for chunk in chunks:
+                    context = (f"Previous compact state:\n{text}\nNew conversation:\n" if text else "") + chunk
+                    req = ChatRequest(
+                        messages=[ChatMessage(role="user", content=_SUMMARY_PROMPT.format(journal=context))],
+                        params=GenerationParams(
+                            max_new_tokens=min(200, max(16, int(self.settings.memory_summary_max_tokens))),
+                            temperature=0.0))
+                    parts: List[str] = []
+                    async for delta in plane.generate_stream(req):
+                        parts.append(str(delta))
+                    text = inject_mod.sanitize_model_text("".join(parts)).strip()
+                    if not text or inject_mod.estimate_tokens(text) > 400:
+                        log.warning("offline compact returned empty/oversized summary; using verbatim tail")
+                        return None
         except Exception as exc:  # noqa: BLE001 — degrade to verbatim-tail-only
             log.warning("rollover summary failed: %s", exc)
             return None
-        text = inject_mod.sanitize_model_text("".join(parts))
         return text or None

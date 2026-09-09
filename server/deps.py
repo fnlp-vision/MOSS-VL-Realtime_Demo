@@ -107,9 +107,11 @@ class Runtime:
             self.memory_writer.warmup()
 
     def close_persistence(self) -> None:
-        set_media_store(None)
         if getattr(self, "memory_writer", None) is not None:
-            self.memory_writer.stop()
+            # Embeddings execute native code; never close their stores while a
+            # worker still owns an in-flight job, even when shutdown is slow.
+            self.memory_writer.stop(timeout=None)
+        set_media_store(None)
         if getattr(self, "memory_store", None) is not None:
             self.memory_store.close()
         if self.history is not None:

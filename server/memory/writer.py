@@ -9,12 +9,12 @@ hot path, then a 64-bit difference hash, then descriptor cosine. A static scene
 still leaves one keyframe every `memory_keyframe_force_s` so "what was on the
 table earlier" has something to hit.
 
-Queue overflow drops FRAMES first and never an utterance — losing a spoken turn
-from memory is a real regression; losing one of many near-identical frames is
-not.
+Shutdown seals the input queue and drains accepted jobs before returning. A
+separate wakeup event keeps the stop notification independent of queue capacity.
 """
 from __future__ import annotations
 
+import math
 import queue
 import threading
 import time
@@ -48,8 +48,10 @@ class MemoryWriter:
         self.media = media
         self.text = text_embedder or embed_mod.build_text_embedder(settings)
         self.image = image_embedder or embed_mod.build_image_embedder(settings)
-        self._q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=512)
+        self._q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=512)
         self._thread: Optional[threading.Thread] = None
+        self._lifecycle_lock = threading.RLock()
+        self._wakeup = threading.Event()
         self._frames: Dict[str, _FrameState] = {}
         # conversation_id -> set((role, whitespace-normalized text)): rollover /
         # repeated output must not store the same utterance twice (board parity);
@@ -57,7 +59,8 @@ class MemoryWriter:
         self._seen_utterances: Dict[str, set] = {}
         self._seen_lock = threading.Lock()
         self._stopping = False
-        self.stats = {"utterances": 0, "frames_kept": 0, "frames_skipped": 0, "dropped": 0}
+        self.stats = {"utterances": 0, "frames_kept": 0, "frames_skipped": 0,
+                      "dropped": 0, "utterances_rejected": 0}
 
     def _mark_utterance_seen(self, conversation_id: str, role: str, text: str) -> bool:
         """True on first sight, False on an exact duplicate (whitespace-normalized)."""
@@ -72,56 +75,96 @@ class MemoryWriter:
     # ---- lifecycle ----
 
     def start(self) -> None:
-        if self._thread is not None:
-            return
-        self.store.open()
-        self._thread = threading.Thread(target=self._run, name="memory-writer", daemon=True)
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._thread is not None:
+                if self._stopping:
+                    raise RuntimeError("memory writer is still stopping; retry stop() before restarting")
+                return
+            self.store.open()
+            self._stopping = False
+            if self._q.empty():
+                self._wakeup.clear()
+            else:
+                self._wakeup.set()
+            self._thread = threading.Thread(target=self._run, name="memory-writer", daemon=True)
+            self._thread.start()
         log.info("memory writer started (text=%s dim=%s, image=%s dim=%s)",
                  getattr(self.text, "name", "?"), getattr(self.text, "dim", "?"),
                  getattr(self.image, "name", "?"), getattr(self.image, "dim", "?"))
 
-    def stop(self, timeout: float = 5.0) -> None:
-        if self._thread is None:
+    def stop(self, timeout: Optional[float] = None) -> None:
+        """Seal and drain the writer; only return once the worker has exited.
+
+        None is a graceful, unbounded wait. On an explicit timeout the writer
+        stays sealed and its thread handle is retained. Call stop() again to
+        finish joining before closing stores or releasing embedding resources.
+        """
+        if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
+            raise ValueError("timeout must be finite and non-negative, or None")
+        with self._lifecycle_lock:
+            thread = self._thread
+            if thread is threading.current_thread():
+                raise RuntimeError("memory writer cannot join itself")
+            self._stopping = True
+            self._wakeup.set()
+        if thread is None:
             return
-        self._stopping = True
-        try:
-            self._q.put_nowait(None)
-        except queue.Full:
-            pass
-        self._thread.join(timeout=timeout)
-        self._thread = None
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            raise TimeoutError(f"memory writer has not stopped; {self._q.qsize()} jobs remain queued")
+        with self._lifecycle_lock:
+            if self._thread is thread:
+                self._thread = None
 
     # ---- producers (hot path: enqueue only) ----
 
-    def _put(self, job: Dict[str, Any], *, droppable: bool) -> None:
-        if self._stopping:
-            return
-        try:
-            self._q.put_nowait(job)
-        except queue.Full:
-            self.stats["dropped"] += 1
-            if not droppable:
-                # make room by discarding one droppable job, then retry once
-                try:
-                    self._q.get_nowait()
-                    self._q.put_nowait(job)
-                except (queue.Empty, queue.Full):
-                    pass
+    def _put(self, job: Dict[str, Any], *, droppable: bool) -> bool:
+        with self._lifecycle_lock:
+            if self._stopping:
+                return False
+            try:
+                self._q.put_nowait(job)
+            except queue.Full:
+                if droppable:
+                    self.stats["dropped"] += 1
+                    return False
+                # Replace only a frame; preserve FIFO order and unfinished_tasks.
+                # The consumer shares lifecycle_lock, so it cannot race eviction.
+                with self._q.mutex:
+                    victim = next((i for i, queued in enumerate(self._q.queue)
+                                   if queued.get("t") == "frame"), None)
+                    if victim is None:
+                        self.stats["utterances_rejected"] += 1
+                        log.error("memory queue full: utterance NOT accepted for %s; "
+                                  "accepted utterances retained", job.get("conv"))
+                        return False
+                    del self._q.queue[victim]
+                    self._q.queue.append(job)
+                    self.stats["dropped"] += 1
+            self._wakeup.set()
+            return True
 
     def note_utterance(self, conversation_id: str, role: str, text: str, *, lang: str,
                        session_ts: Optional[float] = None, media_ts: Optional[float] = None,
-                       importance: float = 0.5) -> None:
+                       importance: float = 0.5) -> bool:
         text = (text or "").strip()
         if not text:
-            return
-        if not self._mark_utterance_seen(conversation_id, role, text):
-            log.debug("dropped duplicate %s utterance for %s: %r",
-                      role, conversation_id, text[:60])
-            return
-        self._put({"t": "utterance", "conv": conversation_id, "role": role, "text": text,
-                   "lang": lang, "session_ts": session_ts, "media_ts": media_ts,
-                   "importance": importance}, droppable=False)
+            return False
+        with self._lifecycle_lock:
+            if self._stopping:
+                return False
+            if not self._mark_utterance_seen(conversation_id, role, text):
+                log.debug("dropped duplicate %s utterance for %s: %r",
+                          role, conversation_id, text[:60])
+                return True
+            accepted = self._put({"t": "utterance", "conv": conversation_id, "role": role, "text": text,
+                       "lang": lang, "session_ts": session_ts, "media_ts": media_ts,
+                       "importance": importance}, droppable=False)
+            if not accepted:
+                with self._seen_lock:
+                    self._seen_utterances[str(conversation_id)].discard(
+                        (str(role), " ".join(text.split())))
+            return accepted
 
     def note_frame(self, conversation_id: str, jpeg: bytes, *, session_ts: Optional[float] = None,
                    media_ts: Optional[float] = None, lang: str = "zh") -> None:
@@ -134,9 +177,15 @@ class MemoryWriter:
 
     def _run(self) -> None:
         while True:
-            job = self._q.get()
-            if job is None:
-                break
+            self._wakeup.wait()
+            with self._lifecycle_lock:
+                try:
+                    job = self._q.get_nowait()
+                except queue.Empty:
+                    if self._stopping:
+                        return
+                    self._wakeup.clear()
+                    continue
             try:
                 self._handle(job)
             except Exception as exc:  # noqa: BLE001 — memory must never kill a session
@@ -227,12 +276,17 @@ class MemoryWriter:
             except Exception as exc:  # noqa: BLE001
                 log.debug("memory warmup: image embedder not preloaded (%s)", exc)
 
-    def drain(self, timeout: float = 10.0) -> None:
-        """Block until the queue is empty (tests + manual probing only)."""
-        deadline = time.monotonic() + timeout
-        while not self._q.empty() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self._q.join()
+    def drain(self, timeout: Optional[float] = 10.0) -> None:
+        """Wait for queued AND in-flight jobs, honoring the supplied deadline."""
+        if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
+            raise ValueError("timeout must be finite and non-negative, or None")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._q.all_tasks_done:
+            while self._q.unfinished_tasks:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError("memory writer drain timed out")
+                self._q.all_tasks_done.wait(remaining)
 
     def forget(self, conversation_id: str) -> None:
         self._frames.pop(conversation_id, None)
