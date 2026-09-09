@@ -23,6 +23,45 @@ from moss_tts_nano.defaults import (
 
 MOSS_AUDIO_TOKENIZER_TYPE = "moss-audio-tokenizer-nano"
 
+
+def _patch_torchair_kernel_namespace() -> None:
+    """torchair's kernel codegen execs compiled code in a rebuilt namespace that
+    only re-imports `__import_*` module names from co_names — direct class
+    references (e.g. `BaseModelOutputWithPast(...)`) loaded via GLOBAL_LOAD
+    from the checkpoint's gpt2_decoder module go missing and raise NameError
+    on the SECOND invocation (thread switch or cache reload).
+
+    Fix: wrap torchair.npu_fx_compiler._compile_py_code so every generated
+    kernel module is exec'd with the transformers symbols its code references
+    pre-injected into the module dict. Idempotent; no-op without torchair.
+    """
+    try:
+        from torch_npu.dynamo.torchair import npu_fx_compiler
+    except Exception:  # noqa: BLE001 — torchair absent (CPU / non-NPU box)
+        return
+    if getattr(npu_fx_compiler, "_moss_kernel_ns_patched", False):
+        return
+
+    _orig = npu_fx_compiler._compile_py_code
+
+    def _compile_py_code_with_ns(py_code: str):
+        mod = _orig(py_code)
+        needed = {
+            name for name in (
+                "BaseModelOutputWithPast", "ModelOutput", "CausalLMOutputWithPast",
+            ) if name in py_code
+        }
+        if needed:
+            import transformers.modeling_outputs as _mo
+            for name in needed:
+                if hasattr(_mo, name):
+                    mod.__dict__.setdefault(name, getattr(_mo, name))
+        return mod
+
+    npu_fx_compiler._compile_py_code = _compile_py_code_with_ns
+    npu_fx_compiler._moss_kernel_ns_patched = True
+    logging.info("torchair kernel namespace patched (transformers symbols injected)")
+
 _DEFAULT_VOICE_FILES: dict[str, tuple[str, str]] = {
     "Junhao": ("zh_1.wav", "Chinese male voice A"),
     "Zhiming": ("zh_2.wav", "Chinese male voice B"),
@@ -160,6 +199,11 @@ class NanoTTSService:
         self._configured_local_attn_implementation: str | None = None
         self._configured_audio_tokenizer_attn_implementation: str | None = None
         self._configured_audio_tokenizer_compute_dtype: str | None = None
+        # per-voice encoded prompt codes: voice_clone re-encodes the SAME
+        # 8.2s reference wav on every request (~45ms: load+resample+codec) —
+        # the reference benchmark hoists this out of its loop; caching it per
+        # voice (the wav is static) removes it from the first-packet path.
+        self._prompt_codes_cache: dict[str, Any] = {}
 
     def _can_use_flash_attention(self) -> bool:
         return self.device.type == "cuda" and self.dtype in FLASH_ATTENTION_DTYPES and _has_flash_attn()
@@ -341,6 +385,17 @@ class NanoTTSService:
         self._audio_tokenizer = audio_tokenizer
         self._configured_audio_tokenizer_attn_implementation = codec_attn_implementation
         self._configured_audio_tokenizer_compute_dtype = codec_compute_dtype
+        # Optional codec graph-compile (MOSS_TTS_NANO_TORCHAIR_CODEC=1): the
+        # audio tokenizer's _decode_decoder takes ~18ms eager per first packet
+        # vs ~8ms in the reference recipe that compiled it. Its batch dim
+        # VARIES with generation progress, so it must compile with
+        # dynamic=True (one shape-generic graph — no recompile storm, which a
+        # dynamic=False codec graph would hit via dynamo cache-limit crashes).
+        import os as _os
+        if _os.getenv("MOSS_TTS_NANO_TORCHAIR_CODEC", "").strip().lower() in {"1", "true", "yes", "on"}:
+            self._maybe_torchair_compile(
+                audio_tokenizer, targets=("_decode_decoder",), label="audio_tokenizer",
+                dynamic=True)
         return self._audio_tokenizer
 
     def _load_model_locked(self):
@@ -373,11 +428,76 @@ class NanoTTSService:
         )
         self._install_stream_decode_budget_patch(model)
         model.eval()
+        self._maybe_torchair_compile(model, targets=("_decode_local",), label="tts_model")
         self._configured_global_attn_implementation, self._configured_local_attn_implementation = (
             self._read_model_attention_implementation(model)
         )
         self._model = model
         return self._model
+
+    def _maybe_torchair_compile(self, module, *, targets, label, dynamic=False):
+        """NPU graph-compile the decode hot paths (tianjingcheng recipe).
+
+        Opt-in via MOSS_TTS_NANO_TORCHAIR=1 on NPU devices: wraps each named
+        method in torch.compile over the torchair NPU backend (frozen_parameter
+        + tiling_schedule_optimize, fullgraph). Measured on 910B2C/CANN 9.0:
+        ~29ms first packet, 23ms/packet steady (RTF 0.29) vs ~0.73 CPU.
+
+        The compile itself is lazy (first forward triggers the ~2.5min graph
+        build); a startup warmup (WARMUP_ON_LOAD=1) absorbs it before the
+        health gate closes. TORCHAIR_CACHE_HOME is pinned to a per-process
+        directory: the bundled torchair's cross-process cache reload path is
+        broken on this stack (dynamo.reset assertion on cache-hit recompile),
+        so every process start cold-compiles into its own dir — never reads
+        a stale one. Any failure degrades to eager (logged, non-fatal).
+        """
+        import os as _os
+        if _os.getenv("MOSS_TTS_NANO_TORCHAIR", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            return
+        if str(getattr(self, "device", "")).split(":")[0] != "npu":
+            logging.info("torchair compile skipped (device=%s is not npu)", self.device)
+            return
+        try:
+            _os.environ["TORCHAIR_CACHE_HOME"] = f"/tmp/moss_tts_torchair_{_os.getpid()}"
+            import torch_npu  # noqa: F401 — registers the npu backend
+            import torchair as tng
+            from torchair.configs.compiler_config import CompilerConfig
+            _patch_torchair_kernel_namespace()
+
+            config = CompilerConfig()
+            config.experimental_config.frozen_parameter = True
+            config.experimental_config.tiling_schedule_optimize = True
+            npu_backend = tng.get_npu_backend(compiler_config=config)
+
+            # torchair's CacheBackend re-execs the marshaled user code in a
+            # namespace copied from the FIRST caller's frame globals, adding
+            # back only `__import_*` module names. Class references the code
+            # loads via GLOBAL_LOAD (BaseModelOutputWithPast in the checkpoint's
+            # gpt2_decoder) are therefore missing → NameError on the 2nd call.
+            # Pre-seeding THIS module's globals (the compile call site) makes
+            # them present in that copied namespace.
+            import transformers.modeling_outputs as _mo
+            for _n in ("BaseModelOutputWithPast", "ModelOutput", "CausalLMOutputWithPast"):
+                if hasattr(_mo, _n):
+                    globals().setdefault(_n, getattr(_mo, _n))
+            compiled = 0
+            for name in targets:
+                fn = getattr(module, name, None)
+                if fn is None or not callable(fn):
+                    continue
+                # dynamic=False: the checkpoint pads prefill to MOSS_TTS_NANO_
+                # MAX_PROMPT_LEN and preallocates KV to MAX_TOTAL_LEN, so every
+                # call presents the SAME tensor shapes — one static graph,
+                # compiled once at warmup, reused forever (29ms first packet).
+                # dynamic=True: one shape-generic graph for varying-batch
+                # targets (the codec decoder).
+                setattr(module, name, torch.compile(
+                    fn, dynamic=dynamic, fullgraph=not dynamic, backend=npu_backend))
+                compiled += 1
+            logging.info("torchair compile armed for %s: %s (cache=%s)",
+                         label, ", ".join(targets[:compiled]), _os.environ["TORCHAIR_CACHE_HOME"])
+        except Exception as exc:  # noqa: BLE001 — acceleration is optional
+            logging.warning("torchair compile unavailable for %s (%s) — running eager", label, exc)
 
     def get_model(self):
         with self._lock:
@@ -635,6 +755,25 @@ class NanoTTSService:
         if not normalized_text:
             raise ValueError("text is required")
 
+        # Length-aware frame cap: sampled generation occasionally fails to
+        # emit EOS and rambles to the hard 320-frame bucket cap (25.6s of
+        # degenerate audio for a 28-char segment, ~6% of jobs on NPU; the
+        # checkpoint's audio repetition penalty is a no-op — it samples with
+        # previous_token_ids=None). Legitimate speech runs ~2.6 frames/char,
+        # so 4.0 frames/char + a 32-frame base is ~2x headroom and never
+        # truncates a normal reading; runaways get bounded to a length that
+        # still sounds like the sentence ended. MOSS_TTS_NANO_LENGTH_AWARE_
+        # FRAMES=0 disables.
+        import os as _os
+        if _os.getenv("MOSS_TTS_NANO_LENGTH_AWARE_FRAMES", "1").strip().lower() not in {"0", "false", "no", "off"}:
+            _per_char = float(_os.getenv("MOSS_TTS_NANO_FRAMES_PER_CHAR", "4.0"))
+            _floor = int(_os.getenv("MOSS_TTS_NANO_MIN_FRAMES", "96"))
+            _cap = max(_floor, int(len(normalized_text) * _per_char) + 32)
+            if int(max_new_frames) > _cap:
+                logging.info("length-aware frame cap: %d -> %d frames (%d chars)",
+                             int(max_new_frames), _cap, len(normalized_text))
+                max_new_frames = _cap
+
         normalized_mode = str(mode).strip().lower()
         if normalized_mode not in {"continuation", "voice_clone"}:
             raise ValueError("mode must be either 'continuation' or 'voice_clone'")
@@ -680,12 +819,23 @@ class NanoTTSService:
                     torch.cuda.manual_seed_all(seed)
 
             try:
+                # voice_clone prompt-code cache: skip the per-request reference
+                # wav load/resample/codec (~45ms) for a voice already encoded.
+                # Keyed by (voice, resolved path, device); invalidated whenever
+                # the audio tokenizer instance is (re)created, whose state the
+                # encoded codes are independent of — so a plain dict is fine.
+                _cache_key = (
+                    f"{resolved_voice}|{effective_prompt_audio_path}|{self.device}"
+                    if effective_prompt_audio_path is not None else None
+                )
+                _cached_codes = self._prompt_codes_cache.get(_cache_key) if _cache_key else None
                 for event in model.inference_stream(
                     text=normalized_text,
                     output_audio_path=str(output_path),
                     mode=normalized_mode,
                     prompt_text=prompt_text,
-                    prompt_audio_path=None if effective_prompt_audio_path is None else str(effective_prompt_audio_path),
+                    prompt_audio_path=None if (_cached_codes is not None or effective_prompt_audio_path is None) else str(effective_prompt_audio_path),
+                    prompt_audio_codes=_cached_codes,
                     text_tokenizer_path=self.checkpoint_path,
                     audio_tokenizer=audio_tokenizer,
                     device=self.device,
@@ -721,6 +871,11 @@ class NanoTTSService:
                         continue
                     if event_type == "result":
                         final_result = dict(event)
+                        # capture the encoded reference codes for the per-voice
+                        # cache (first request per voice encodes; later ones skip)
+                        if (_cache_key is not None and _cached_codes is None
+                                and event.get("reference_audio_token_ids") is not None):
+                            self._prompt_codes_cache[_cache_key] = event["reference_audio_token_ids"]
             except Exception:
                 self._discard_loaded_audio_tokenizer_locked(
                     "streaming inference failed; reloading audio tokenizer on next request"

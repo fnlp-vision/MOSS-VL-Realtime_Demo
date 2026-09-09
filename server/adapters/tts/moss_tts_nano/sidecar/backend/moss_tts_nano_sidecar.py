@@ -146,30 +146,46 @@ def _warmup_service(service: Any) -> None:
     if not _bool(os.getenv("MOSS_TTS_NANO_WARMUP_ON_LOAD", "1"), True):
         return
     text = os.getenv("MOSS_TTS_NANO_WARMUP_TEXT", "你好，欢迎使用 Nano-TTS。").strip() or "你好，欢迎使用 Nano-TTS。"
-    voice = os.getenv("MOSS_TTS_NANO_VOICE", "Junhao")
+    # comma-separated voices: on the torchair/NPU path each voice preset has a
+    # distinct prompt length → first synthesis per voice recompiles (10-15s) or
+    # fails once (frozen-parameter graph stale after a discard). Warming every
+    # listed voice inside the health gate makes the FIRST user request of each
+    # voice hit the ready graph. Default: the two voices the UI offers first.
+    voices = [
+        v.strip() for v in os.getenv("MOSS_TTS_NANO_WARMUP_VOICES", "Junhao,Yuewen").split(",") if v.strip()
+    ] or [os.getenv("MOSS_TTS_NANO_VOICE", "Junhao")]
     started = time.monotonic()
-    try:
-        service.get_model()
-        if _backend_name() == "onnx" or hasattr(service, "execution_provider"):
-            result = service.warmup()
-        else:
-            result = service.warmup(text=text, voice=voice)
-        audio_path = result.get("audio_path") if isinstance(result, dict) else None
-        if audio_path:
-            try:
-                Path(str(audio_path)).unlink(missing_ok=True)
-            except Exception:
-                pass
-        log.info(
-            "MOSS-TTS-Nano warmup complete: backend=%s elapsed=%.3fs synth_elapsed=%s text_chars=%d voice=%s",
-            _backend_name(),
-            time.monotonic() - started,
-            f"{float(result.get('elapsed_seconds', 0.0)):.3f}s" if isinstance(result, dict) else "n/a",
-            len(text),
-            voice,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning("MOSS-TTS-Nano warmup failed: backend=%s error=%s", _backend_name(), exc)
+    for voice in voices:
+        try:
+            service.get_model()
+            if _backend_name() == "onnx" or hasattr(service, "execution_provider"):
+                result = service.warmup()
+            else:
+                # warm through the STREAMING path: the torchair graph shapes
+                # exercised by synthesize() differ subtly from synthesize_stream's
+                # (a first streamed request on the synthesize()-warmed graph hits
+                # a GE execute error and discards the model). Consuming the
+                # stream here compiles exactly the production shapes.
+                result = {}
+                for event in service.synthesize_stream(text=text, voice=voice):
+                    if isinstance(event, dict) and event.get("type") == "result":
+                        result = event
+                        break
+            audio_path = result.get("audio_path") if isinstance(result, dict) else None
+            if audio_path:
+                try:
+                    Path(str(audio_path)).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            log.info(
+                "MOSS-TTS-Nano warmup complete: backend=%s voice=%s text_chars=%d elapsed=%.3fs",
+                _backend_name(),
+                voice,
+                len(text),
+                time.monotonic() - started,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("MOSS-TTS-Nano warmup failed: backend=%s voice=%s error=%s", _backend_name(), voice, exc)
 
 def _normalize_audio(audio_array: Any) -> np.ndarray:
     array = np.asarray(audio_array, dtype=np.float32)
