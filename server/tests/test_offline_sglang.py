@@ -172,11 +172,10 @@ async def test_media_prep() -> None:
     assert content == "<|image|><|image|><|video|>这是什么？", content
     assert len(image_data) == 2
     assert image_data[0] == "data:image/png;base64,AAAA"  # data-URL passes through
-    # image CAS handle → blob BYTES as base64 (sglang's path branch is
-    # extension-gated and CAS blobs have no extension); video handle → PATH
-    # (the video loader is extension-agnostic; bytes would bloat the JSON)
+    # image CAS handle → blob bytes wrapped in data: URL (sglang's
+    # get_image_bytes treats strings starting with "/" as file paths)
     import base64 as _b64
-    assert image_data[1] == _b64.b64encode(b"fake-jpeg-bytes").decode("ascii")
+    assert image_data[1] == "data:image;base64," + _b64.b64encode(b"fake-jpeg-bytes").decode("ascii")
     assert len(video_data) == 1 and os.path.exists(video_data[0])
 
     # user-typed placeholder suppresses ONE auto-insertion (board skip logic)

@@ -50,7 +50,21 @@ class Segmenter:
 
     def _find_cut(self, final: bool) -> int:
         if final:
-            return len(self.buffer)
+            # flush() must still honor max_chars: an over-long tail (a model
+            # round that never hit a sentence boundary) would otherwise be
+            # handed to TTS as one giant segment, which the engine's frame
+            # cap hard-truncates — an audible mid-word cut. Cut at sentence
+            # marks / boundaries first; only a truly unpunctuated remainder
+            # shorter than max_chars goes out whole.
+            if len(self.buffer) <= self.max_chars:
+                return len(self.buffer)
+            match = None
+            for match in SENTENCE_END_RE.finditer(self.buffer):
+                if match.end() >= self.max_chars:
+                    break
+            if match and match.end() >= self.min_chars:
+                return match.end()
+            return self._boundary_cut(self.max_chars)
         if len(self.buffer) < self.min_chars:
             return 0
         match = None

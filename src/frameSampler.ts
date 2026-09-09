@@ -59,7 +59,7 @@ export interface FrameSampler {
 export function startFrameSampler(
   video: HTMLVideoElement,
   send: (jpeg: ArrayBuffer, captureTsMs: number) => void,
-  { fps = 1, maxEdge = 512, quality = 0.75, shouldSend, clock = 'live', effFps, dedup }: FrameSamplerOptions = {},
+  { fps = 1, maxEdge = 512, quality = 0.75, shouldSend, clock = 'live' }: FrameSamplerOptions = {},
 ): FrameSampler {
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d');

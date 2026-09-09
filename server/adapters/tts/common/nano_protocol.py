@@ -48,8 +48,11 @@ class NanoProtocolEngine:
     # ---- per-provider hook ------------------------------------------------
 
     def form_fields(self, text: str, voice: Optional[str]) -> Dict[str, Any]:
-        """Form fields for /api/generate-stream/start; subclasses extend."""
-        return {"text": text, "voice": voice or self.voice}
+        """Form fields for /api/generate-stream/start; subclasses extend.
+        Override do_sample, audio_temperature and audio_top_p to reduce
+        intermittent sampling artifacts on NPU."""
+        return {"text": text, "voice": voice or self.voice,
+                "do_sample": "0", "audio_temperature": "0.6"}
 
     # ---- lifecycle ---------------------------------------------------------
 

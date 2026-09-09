@@ -146,6 +146,7 @@ class HfMossVlAdapter:
         self.model_config: dict = {}
         self._attn_impl: Optional[str] = None    # resolved at load()
         self._infer_lock = threading.Lock()      # one active realtime session per model
+        self._infer_lock_owner: Optional[str] = None  # session_id that holds _infer_lock
         self._sessions: Dict[str, RealtimeSession] = {}
         self._sessions_lock = threading.Lock()
 
@@ -283,6 +284,7 @@ class HfMossVlAdapter:
         self._ensure_realtime_ready()
         if not self._infer_lock.acquire(blocking=False):
             raise RuntimeError("A realtime session is already running on this model")
+        self._infer_lock_owner = None  # set once the session id exists
 
         try:
             s = self.s
@@ -314,6 +316,7 @@ class HfMossVlAdapter:
             install_realtime_token_counter_patch(self.model)
 
             session_id = str(uuid.uuid4())
+            self._infer_lock_owner = session_id
             frame_queue = RealTimeFrameQueue(maxsize=max(1, frame_queue_size or s.frame_queue_size))
             prompt_queue: "queue.Queue[str]" = queue.Queue()
             stop_event = threading.Event()
@@ -390,10 +393,12 @@ class HfMossVlAdapter:
                     except Exception:  # noqa: BLE001
                         pass
                     stop_event.set()
-                    try:
-                        self._infer_lock.release()
-                    except RuntimeError:
-                        pass
+                    if self._infer_lock_owner == session_id:
+                        self._infer_lock_owner = None
+                        try:
+                            self._infer_lock.release()
+                        except RuntimeError:
+                            pass
                     log.info(
                         "Realtime session %s exited (frames=%d consumed=%d outputs=%d non_silence=%d)",
                         session_id, session.frames_received, session.frames_consumed,
@@ -408,6 +413,7 @@ class HfMossVlAdapter:
             log.info("Started realtime session %s on %s", session_id, self.device)
             return session
         except Exception:
+            self._infer_lock_owner = None
             try:
                 self._infer_lock.release()
             except RuntimeError:
@@ -427,14 +433,27 @@ class HfMossVlAdapter:
         if session is None:
             raise KeyError(f"Realtime session not found: {session_id}")
         session.stop_event.set()
-        try:
-            stop_fn = getattr(self.model, "stop_real_time_generate", None)
-            if callable(stop_fn):
-                stop_fn()
-        except Exception:  # noqa: BLE001
-            pass
+        # stop_real_time_generate() may block on a device-sync call
+        # (torch.npu.empty_cache on a busy CANN device). Run it on a daemon
+        # thread so the join + force-release below always executes — the flag
+        # flip inside it makes the runner exit promptly regardless.
+        stop_fn = getattr(self.model, "stop_real_time_generate", None)
+        if callable(stop_fn):
+            threading.Thread(target=stop_fn, daemon=True).start()
         if session.thread is not None:
             session.thread.join(timeout=timeout_seconds)
+            if session.thread.is_alive() and self._infer_lock_owner == session_id:
+                # The runner is wedged in the model loop (NPU op in flight) and
+                # its finally-block cannot run — force-release the infer lock so
+                # a new session can start; the zombie's late finally sees the
+                # owner no longer matches and leaves the (re-acquired) lock alone.
+                log.warning("Realtime session %s thread stuck after %.0fs — "
+                            "force-releasing infer lock", session_id, timeout_seconds)
+                self._infer_lock_owner = None
+                try:
+                    self._infer_lock.release()
+                except RuntimeError:
+                    pass
         return session.status_payload()
 
     # ---- offline chat ----
@@ -605,8 +624,8 @@ class HfMossVlAdapter:
         return Image.open(BytesIO(raw)).convert("RGB")
 
     @staticmethod
-    def _resolve_chat_video(payload: str) -> dict:
-        """One uploaded chat video → `{"video_path": …}` for the processor.
+    def _resolve_chat_video(payload: str) -> str:
+        """One uploaded chat video → path string for the processor.
 
         Videos are accepted ONLY as CAS handles (`sha256:<hex>` / bare 64-hex)
         minted by POST /api/media — never raw paths or inline base64, so a
@@ -614,6 +633,10 @@ class HfMossVlAdapter:
         pure path math (persistence.media.resolve_blob_path), so it works in
         VLM worker processes too; the video processor decodes the blob itself
         (torchcodec sniffs the container, the extension-less name is fine).
+
+        Returns a plain path string (not a dict) so the processor's
+        fetch_videos takes the "Single video path" branch, which decodes
+        the entire video without requiring a "segments" key.
         """
         from ....persistence.media import normalize_hash, resolve_blob_path
 
@@ -624,7 +647,7 @@ class HfMossVlAdapter:
         path = resolve_blob_path(s)
         if path is None:
             raise ValueError(f"unknown video media: {s[:19]}…")
-        return {"video_path": path}
+        return path
 
     @classmethod
     def _prepare_chat_messages(cls, req: Any) -> Tuple[list, list, list]:

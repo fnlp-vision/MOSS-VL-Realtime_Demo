@@ -196,6 +196,13 @@ def _pcm16le(audio_array: Any) -> bytes:
         return b""
     array = np.nan_to_num(array, nan=0.0, posinf=1.0, neginf=-1.0)
     array = np.clip(array, -1.0, 1.0)
+    # Prevent hard-clip distortion: the model intermittently emits peaks > 1.0.
+    # Scaling those samples to full scale flat-tops them, which is the audible
+    # "noise burst" mid-speech. Normalize the chunk's peak to 0.92 so the
+    # loudest sample stays below full scale (keeps dynamics, no distortion).
+    peak = float(np.max(np.abs(array))) if array.size else 0.0
+    if peak > 0.92:
+        array = array * (0.92 / peak)
     pcm = (array * 32767.0).astype("<i2", copy=False)
     return pcm.tobytes(order="C")
 

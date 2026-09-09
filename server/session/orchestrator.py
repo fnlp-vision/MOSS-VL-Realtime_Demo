@@ -169,6 +169,16 @@ class Orchestrator:
         # kept encoded: decode is the VLM session's job (worker-side)
         self._latest_frame: Optional[Tuple[bytes, Optional[float], float]] = None
         self._vlm_dead = False
+        # ---- motion gate (server-side frame-diff narration gate) ----
+        # smoothed 32x18 grayscale frame-diff (0..1); drives ROUND_START
+        # suppression (static scene → silence) and silence interception
+        # (fresh change → force the model to narrate it)
+        self._motion_level = 0.0
+        self._motion_episode_active = False   # level >= suppress threshold
+        self._motion_narrated = False          # current episode already spoken
+        self._last_sig: Optional[bytes] = None
+        self._force_prompt_at = 0.0            # monotonic of last injected prompt
+        self._motion_tasks: set = set()        # keep force-narration tasks alive
         # current video-source segment from `input.video.source` (None until the
         # client announces one — legacy clients never do). Frame timestamps ride
         # one monotone session clock (live_control_overhaul.md §12); file
@@ -302,6 +312,7 @@ class Orchestrator:
                 self._emit_error("bad_frame", "timestamp must be finite and non-negative")
                 return
         self._latest_frame = (jpeg, timestamp, time.monotonic())
+        self._update_motion(jpeg)
         if self.memory is not None:
             try:
                 # throttled + enqueue-only; real dedup runs on the writer thread
@@ -851,14 +862,90 @@ class Orchestrator:
             elif part:
                 self._handle_content(part, emitted_at)
 
+    # ---- motion gate (frame-diff narration gate) -------------------------
+
+    def _motion_gate_active(self) -> bool:
+        s = self.settings
+        if not s.motion_gate_enabled:
+            return False
+        seg = self._segment or {}
+        return seg.get("kind") in (None, "camera", "screen")
+
+    def _update_motion(self, jpeg: bytes) -> None:
+        s = self.settings
+        if not s.motion_gate_enabled:
+            return
+        try:
+            from io import BytesIO
+            from PIL import Image
+            img = Image.open(BytesIO(jpeg)).convert("L").resize((32, 18))
+            sig = img.tobytes()
+            if self._last_sig is not None and len(sig) == len(self._last_sig):
+                diff = sum(abs(a - b) for a, b in zip(sig, self._last_sig)) / len(sig) / 255.0
+                self._motion_level = self._motion_level * 0.6 + diff * 0.4
+                if self._motion_level >= s.motion_gate_suppress_threshold:
+                    if not self._motion_episode_active:
+                        self._motion_episode_active = True
+                        self._motion_narrated = False
+                else:
+                    self._motion_episode_active = False
+            self._last_sig = sig
+        except Exception:
+            pass
+
+    async def _force_narration(self) -> None:
+        if self._vlm_dead:
+            return
+        try:
+            await asyncio.to_thread(self.engines.vlm.put_prompt, self.settings.motion_gate_prompt)
+            self._motion_narrated = True
+            self.metrics["motion_forced"] = self.metrics.get("motion_forced", 0) + 1
+            log.info("motion-gate: forced narration prompt")
+        except Exception as exc:
+            log.warning("motion-gate force prompt failed: %s", exc)
+
     def _handle_control_token(self, token: str) -> None:
         if token == ROUND_START:
             if self._drop_model_tail and getattr(self.engines.vlm, "turn_interrupt_is_local", False):
                 return
             self._drop_model_tail = False  # an explicit round always speaks
+            # motion gate (narration rounds only — a pending user turn is the
+            # model answering, never suppressed): a static scene needs no
+            # narration, so hold the round at silence.
+            if (self._pending_turn_t0 is None
+                    and self._motion_gate_active()
+                    and self._motion_level < self.settings.motion_gate_suppress_threshold):
+                self.metrics["motion_suppressed"] = self.metrics.get("motion_suppressed", 0) + 1
+                self._drop_model_tail = True
+                return
+            # backlog gate: while the listener is far behind on unplayed audio,
+            # a new narration round would only queue text the listener can't
+            # hear yet (and be retired unspoken by the next round — measured:
+            # 68% of camera rounds never reached synthesis). Hold such rounds
+            # at silence; the gate opens as soon as the backlog drains.
+            gate_s = self.settings.realtime_backlog_gate_s
+            if gate_s > 0 and self.audio_queue_seconds() >= gate_s:
+                self.metrics["gated_rounds"] = self.metrics.get("gated_rounds", 0) + 1
+                self._drop_model_tail = True  # swallow this round's narration
+                return
             self._open_response()
         elif token in SILENCE_TOKENS:
             self.metrics["silence_outputs"] += 1
+            # motion gate: a fresh visual change the model failed to announce
+            # (silence despite motion) is forced — inject a prompt so the
+            # change is always narrated. Cooldown guards the re-injection loop.
+            s = self.settings
+            if (self._pending_turn_t0 is None
+                    and self._motion_gate_active()
+                    and self._motion_episode_active
+                    and not self._motion_narrated
+                    and self._motion_level >= s.motion_gate_force_threshold
+                    and time.monotonic() - self._force_prompt_at >= s.motion_gate_cooldown_s):
+                self._force_prompt_at = time.monotonic()
+                task = asyncio.create_task(self._force_narration())
+                self._motion_tasks.add(task)
+                task.add_done_callback(self._motion_tasks.discard)
+                return
             # the realtime model closes a spoken round by going idle —
             # <|silence|> IS the end-of-turn signal (it never emits
             # round_end/im_end on the output stream). Finalizing here splits
@@ -886,6 +973,10 @@ class Orchestrator:
         chunk = JUNK_TOKEN_RE.sub("", chunk)
         if not chunk:
             return
+        # motion gate: real text during an active motion episode means the
+        # change has been narrated — the silence branch will not re-inject.
+        if self._motion_episode_active and self._motion_gate_active():
+            self._motion_narrated = True
         r = self._response
         if not chunk.strip() and (r is None or r.finalized or r.done):
             return  # whitespace between control tokens must not open a response
@@ -935,10 +1026,20 @@ class Orchestrator:
         # drop the backlog, not the mouth).
         if len(self._responses) >= 2:
             speaking = self._tts_turn_id
-            for old in list(self._responses.values()):
-                if old.response_id != speaking and not old.done:
-                    old.stop_reason = p.STOP_INTERRUPTED
-                    self._complete_response(old)
+            retiring = [old for old in self._responses.values()
+                        if old.response_id != speaking and not old.done]
+            newest_retired = max((r.response_id for r in retiring),
+                                 key=self._round_serial, default=None)
+            for old in retiring:
+                old.stop_reason = p.STOP_INTERRUPTED
+                self._complete_response(old)
+                # retire = drop its queued units too: the feeder skips units
+                # of done responses, so leaving them in the deque is pure
+                # dead weight. The NEWEST retired round's units are kept —
+                # under gate/backlog churn that round describes the current
+                # scene best; older narrations are the stale ones.
+                if old.response_id != newest_retired:
+                    self._retire_units(old.response_id)
         rid = f"resp_{next(self._serial)}"
         t0 = self._pending_turn_t0 or time.monotonic()
         self._pending_turn_t0 = None
@@ -950,6 +1051,30 @@ class Orchestrator:
         self.metrics["responses"] += 1
         self.state.emit(p.RESPONSE_CREATED, response_id=rid)
         return new
+
+    @staticmethod
+    def _round_serial(rid: str) -> int:
+        """Monotonic serial of a resp_N id (older rounds sort lower)."""
+        try:
+            return int(rid.rsplit("_", 1)[-1])
+        except ValueError:
+            return -1
+
+    def _retire_units(self, response_id: str) -> None:
+        """Drop a retired response's queued units (segments AND its flush marker).
+
+        The feeder skips segments of done responses, and a stale flush marker
+        would mis-fire end_turn for a turn the engine never spoke — so both
+        must go. Called for every retired round except the newest one, whose
+        units survive so the freshest description can still play once the
+        backlog drains.
+        """
+        before = len(self._units)
+        self._units = type(self._units)(
+            u for u in self._units if u.response_id != response_id)
+        dropped = before - len(self._units)
+        if dropped:
+            self.metrics["units_dropped"] += dropped
 
     def _finalize_response(self, stop_reason: str) -> None:
         r = self._response
@@ -1065,7 +1190,16 @@ class Orchestrator:
                 continue
             head = self._units[0]
             if head.kind == "segment" and not self.should_emit_next_unit():
-                await asyncio.sleep(0.1)
+                # Buffer saturated: instead of a long silent pause, drop the
+                # OLDEST pending unit and keep the pipeline flowing — audio
+                # never stops, the oldest queued speech simply gets skipped.
+                for i, unit in enumerate(self._units):
+                    if unit.kind == "segment":
+                        del self._units[i]
+                        self.metrics["units_dropped"] += 1
+                        log.info("drop-stale: buffer-saturated unit dropped (%r…)", unit.text[:24])
+                        break
+                await asyncio.sleep(0.05)
                 continue
             if self._tts_turn_id and head.response_id != self._tts_turn_id:
                 previous = self._responses.get(self._tts_turn_id)
@@ -1145,10 +1279,12 @@ class Orchestrator:
                     sample_rate=sample_rate,
                     channels=channels,
                     pcm_bytes=len(pcm),
+                    transient=True,
                 )
             elif kind == "tts_turn_end":
                 if r is not None and r.finalized and not r.done:
-                    self.state.emit(p.RESPONSE_AUDIO_DONE, response_id=r.response_id)
+                    self.state.emit(p.RESPONSE_AUDIO_DONE, response_id=r.response_id,
+                                    transient=True)
                     self._complete_response(r)
             elif kind == "tts_error":
                 self._emit_error("tts_error", str(payload.get("message") or "synthesis failed"))

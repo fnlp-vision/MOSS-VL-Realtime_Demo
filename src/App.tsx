@@ -455,7 +455,7 @@ export default function App() {
   // default 4 tok/s; frame sampler default 1 fps).
   // String-backed so decimals/empties type freely; parsed+clamped at connect
   // and normalized on blur (parseParam).
-  const [streamFps, setStreamFps] = useState<string>('1');
+  const [streamFps, setStreamFps] = useState<string>('2');
   const [temperature, setTemperature] = useState<string>('0.7');
   const [topP, setTopP] = useState<string>('0.8');
   const [topK, setTopK] = useState<string>('20');
@@ -1802,6 +1802,14 @@ export default function App() {
     setVideoSourceKind(kind);
     setVideoEnabled(true);
     if (streamConnected) session.setVideoForwarding(true);
+    // source-aware capture profile: screen text needs ~1280px to stay legible
+    // to the vision encoder (512px turns a 1080p screen into unreadable blobs
+    // → hallucinated transcription); camera keeps the token-cheap 512px
+    session.setSamplerProfile(
+      kind === 'screen'
+        ? { maxEdge: 1280, quality: 0.85, effFps: 1, dedup: true }
+        : { maxEdge: 512, quality: 0.75, effFps: 2, dedup: false },
+    );
     announceSource(kind); // one segment per KIND — a camera flip stays quiet
     addLog(kind === 'screen'
       ? (language === 'en' ? 'Screen sharing active.' : '屏幕共享推流就绪。')
@@ -2234,7 +2242,7 @@ export default function App() {
             speakingRate: voiceRate,
             systemPrompt, // KV-prefilled at creation; '' → server default
             videoSource: activeSource, // the INITIAL source (history-facing); mid-session switches ride input.video.source
-            frameFps: parseParam(streamFps, 0.5, 10, 1), // client sampler cadence
+            frameFps: parseParam(streamFps, 0.5, 10, 2), // client sampler cadence (2fps: transient gestures fit between samples at 1)
             temperature: parseParam(temperature, 0, 2, 0.7), // creation-time sampling
             topP: parseParam(topP, 0, 1, 0.8),
             topK: Math.round(parseParam(topK, 1, 100, 20)),
@@ -5413,7 +5421,7 @@ export default function App() {
                         min="0.5" max="10" step="0.5"
                         value={streamFps} disabled={streamConnected}
                         onChange={(e) => setStreamFps(e.target.value)}
-                        onBlur={() => setStreamFps(String(parseParam(streamFps, 0.5, 10, 1)))}
+                        onBlur={() => setStreamFps(String(parseParam(streamFps, 0.5, 10, 2)))}
                         title={streamConnected ? (language === 'en' ? 'Locked while live — applies next call' : '会话中锁定 — 下次连线生效') : undefined}
                       />
                     </div>
