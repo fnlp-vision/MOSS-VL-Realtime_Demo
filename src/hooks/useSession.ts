@@ -91,6 +91,7 @@ export interface UseSessionCallbacks {
    *  ('memory.recalled', also replayed on reconnect — dedupe by item id) —
    *  render them as a transcript memory card. */
   onMemoryRecalled?: (items: MemoryRecallItem[]) => void;
+  onMemoryNotice?: (message: string) => void;
   onLog: (text: string, type?: string) => void;
 }
 
@@ -300,6 +301,10 @@ export function useSession(callbacks: UseSessionCallbacks) {
           kind: String(ev.kind ?? ''),
           ...(typeof ev.name === 'string' && ev.name ? { name: ev.name } : {}),
         });
+        break;
+      }
+      case 'memory.notice': {
+        if (typeof ev.message === 'string') cb.current.onMemoryNotice?.(ev.message);
         break;
       }
       case 'memory.recalled': {

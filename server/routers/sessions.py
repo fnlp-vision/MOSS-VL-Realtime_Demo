@@ -40,7 +40,7 @@ def _vlm_start_params(rt: Runtime, cfg: SessionConfig) -> Dict[str, Any]:
     params = cfg.params
     return dict(
         prompt=cfg.initial_prompt if cfg.initial_prompt is not None else s.initial_prompt,
-        system_prompt=cfg.system_prompt,  # None → board default realtime prompt
+        system_prompt=cfg.system_prompt,  # Preserve the model's trained/default or user-supplied system prompt.
         temperature=params.temperature, top_k=params.top_k, top_p=params.top_p,
         do_sample=params.do_sample, repetition_penalty=params.repetition_penalty,
         max_new_tokens=params.max_new_tokens,
@@ -64,6 +64,9 @@ def _make_reseat_factory(rt: Runtime, cfg: SessionConfig):
                      prefill_messages: Any = None) -> Any:
         params = _vlm_start_params(rt, cfg)
         params["prompt"] = prompt
+        if prefill_messages and not system_prompt and getattr(rt, 'memory_store', None) is not None:
+            from ..memory.rollover import _default_system_prompt
+            system_prompt = cfg.system_prompt or _default_system_prompt()
         params["system_prompt"] = system_prompt
         params["prefill_messages"] = prefill_messages
         return await asyncio.to_thread(rt.vlm.start_realtime_session, **params)

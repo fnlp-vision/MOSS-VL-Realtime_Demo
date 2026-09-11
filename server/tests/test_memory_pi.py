@@ -168,7 +168,7 @@ def test_decide_modes() -> None:
                 tmp, MEMORY_DECISION_MODE="hybrid", MEMORY_PI_URL=pi.url)
             sess.note_user_turn("我刚买了一台尼康 FM2 胶片相机，很喜欢")
             writer.drain()
-            query = "我刚才说的那台胶片相机是什么型号"
+            query = "尼康 FM2 胶片相机是什么型号"
             before = len(pi.httpd.decide_requests)
             _set(s, "memory_retrieval_prefilter_score", 2.0)  # above any cosine
             assert not sess.recall_for_turn(query), "below the prefilter: no recall"

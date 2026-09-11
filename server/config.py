@@ -692,6 +692,10 @@ class Settings:
     # so they are not reconstructible by `history_prune.py --rebuild` and must
     # not be collateral damage of one. "" → {data_dir}/memory.db
     memory_db_path: str = field(default_factory=lambda: _env("MEMORY_DB_PATH", ""))
+    memory_maintenance_interval_s: float = field(default_factory=lambda: _env_float("MEMORY_MAINTENANCE_INTERVAL_S", 30.0))
+    memory_min_free_bytes: int = field(default_factory=lambda: _env_int("MEMORY_MIN_FREE_BYTES", 1024 ** 3))
+    # Soft admission bound on occupied SQLite pages, not historical file size.
+    memory_max_db_bytes: int = field(default_factory=lambda: _env_int("MEMORY_MAX_DB_BYTES", 2 * 1024 ** 3))
     # Text space: BGE-M3 (multilingual, so an English query still hits a Chinese
     # memory). Image space: Chinese-CLIP — ONE space for frames and zh text, so
     # "我刚才给你看的那个" resolves against frames directly, no captioner needed.
@@ -795,8 +799,8 @@ class Settings:
     # retrieval decision gate ahead of MemorySession.recall_for_turn:
     #   vector — local score gates only (pre-pi behavior);
     #   llm    — pi /decide every turn (recent_turns + the current user text);
-    #   hybrid — local raw-score prefilter first, pi /decide only confirms what
-    #            passes (retrospective questions get a loosened prefilter).
+    #   hybrid — explicit history references use pi /decide + query rewriting
+    #            first; other turns retain the local raw-score prefilter.
     memory_decision_mode: str = field(default_factory=lambda: _env("MEMORY_DECISION_MODE", "hybrid"))
     # hybrid stage-1: the best ABSOLUTE raw cosine/maxsim must clear this before
     # pi /decide is consulted (board's 0.75; retro questions run 0.10 looser)

@@ -40,6 +40,7 @@ JOURNAL_TYPES = frozenset({
     "response.text.done",
     "response.done",
     "session.updated",
+    "memory.notice",
 })
 
 _TITLE_MAX = 80
@@ -248,6 +249,9 @@ def _apply_event(index: IndexStore, cid: str,
                 metrics["name"] = name
             index.insert_turn(cid, role="user", text="", ts=ts, seq=seq,
                               source="source_change", metrics=metrics)
+    elif type_ == "memory.notice":
+        index.insert_turn(cid, role="system", text=str(obj.get("message") or ""), ts=ts, seq=seq,
+                          source="memory_notice", metrics={"code": obj.get("code")})
     elif type_ == "response.text.done":
         rid = str(obj.get("response_id") or "")
         resp_text[(cid, rid)] = str(obj.get("text") or "")

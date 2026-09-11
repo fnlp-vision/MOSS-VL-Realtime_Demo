@@ -809,6 +809,10 @@ export default function App() {
     // memory recall renders as its own compact card; the event is journaled
     // and REPLAYED on reconnect, so drop item ids already shown in earlier
     // memory entries (and within the batch itself)
+    onMemoryNotice: (message) => {
+      setStreamConversation((prev) => [...prev,
+        { sender: 'ai', system: true, text: message, time: getFormattedTime() }]);
+    },
     onMemoryRecalled: (items) => {
       setStreamConversation((prev) => {
         const seen = new Set<number>();
@@ -3855,11 +3859,11 @@ export default function App() {
       }
       const turns: LiveReplayTurn[] = conv.turns
         .filter((t) => (t.text || '').trim() || t.source === 'source_change')
-        .map((t) => t.source === 'source_change'
+        .map((t) => (t.source === 'source_change' || t.source === 'memory_notice')
           ? {
               role: 'user' as const,
               system: true,
-              text: sourceChangeLabel(t.metrics?.kind, t.metrics?.name),
+              text: t.source === 'memory_notice' ? t.text : sourceChangeLabel(t.metrics?.kind, t.metrics?.name),
               ts: t.ts,
               mediaTs: null,
             }

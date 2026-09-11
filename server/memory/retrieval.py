@@ -74,6 +74,16 @@ def has_past_reference(text: str) -> bool:
     return any(m in low for m in _PAST_MARKERS_EN)
 
 
+def is_history_question(text: str) -> bool:
+    return has_past_reference(text) and bool(_QUESTION_RE.search(text or ''))
+
+
+def refers_to_dialogue(text: str) -> bool:
+    """Distinguish an explicit prior conversation from a prior camera view."""
+    return bool(re.search(r'(?:我|你|我们).{0,12}(?:说|告诉|提到|问|记住|记得)', text or '')) or bool(
+        re.search(r'\b(?:i|you|we)\b.{0,40}\b(?:said|told|asked|mentioned|remember)\b', text or '', re.I))
+
+
 def _minmax(values: Sequence[float]) -> List[float]:
     """Per-space min-max — the FALLBACK fusion normalizer while a space has
     fewer than _ZNORM_MIN_SAMPLES background observations."""
@@ -132,9 +142,12 @@ class Retriever:
         query = (query or "").strip()
         if not query:
             return []
+        started = time.perf_counter()
         qvec = self.text.encode([query])[0]
+        dense_encoded = time.perf_counter()
         hits = self.store.search(conversation_id, SPACE_TEXT, qvec,
                                  limit=limit * 2, exclude=exclude)
+        dense_searched = time.perf_counter()
         pairs: List[tuple[int, float, str]] = [(i, s, SPACE_TEXT) for i, s in hits]
 
         # late interaction (design §4): where a text_li matrix exists, its
@@ -142,10 +155,12 @@ class Retriever:
         # Pooled search still runs — it discovers items written before the lane
         # was enabled (or without token matrices at all).
         late_scores: Dict[int, float] = {}
+        late_encoded = dense_searched
         encode_tokens = getattr(self.text, "encode_tokens", None)
         if self.settings.memory_late_interaction and callable(encode_tokens):
             try:
                 qtok = encode_tokens([query])[0]
+                late_encoded = time.perf_counter()
                 late_scores = dict(self.store.search_late(conversation_id, qtok,
                                                           limit=limit * 2, exclude=exclude))
             except Exception as exc:  # noqa: BLE001 — pooled retrieval still works
@@ -154,6 +169,7 @@ class Retriever:
             pooled_ids = {i for i, _, _ in pairs}
             pairs = [(i, late_scores.get(i, s), sp) for i, s, sp in pairs]
             pairs.extend((i, s, SPACE_TEXT) for i, s in late_scores.items() if i not in pooled_ids)
+        late_searched = time.perf_counter()
 
         # frames are reachable by a text query only through a cross-modal image
         # embedder; with the fallback descriptor they are recalled via captions
@@ -163,6 +179,12 @@ class Retriever:
                                                     limit=limit, exclude=exclude):
                 pairs.append((item_id, score, SPACE_IMAGE))
 
+        image_searched = time.perf_counter()
+        log.info('memory search session=%s dense_encode_ms=%.1f dense_search_ms=%.1f '
+                 'late_encode_ms=%.1f late_search_ms=%.1f image_ms=%.1f', conversation_id,
+                 (dense_encoded-started)*1000, (dense_searched-dense_encoded)*1000,
+                 (late_encoded-dense_searched)*1000, (late_searched-late_encoded)*1000,
+                 (image_searched-late_searched)*1000)
         if not pairs:
             return []
         by_space = {}

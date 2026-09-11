@@ -45,7 +45,7 @@ _HALF_WIDTH_S = {"秒": 20.0, "分": 60.0, "时": 600.0}
 # "the very start of the conversation" — chronological, not semantic: the
 # referent sits at session_ts ≈ 0 and embedding similarity can never find it
 # ("你好" vs "我最开始说了什么" share no content), so restrict by time
-_SESSION_START_ZH = ("最开始", "一开始", "第一句", "开头", "最早")
+_SESSION_START_ZH = ("最开始", "一开始", "第一句", "开头")
 _SESSION_START_EN = ("first thing", "very first", "at the beginning", "at the start",
                      "beginning of")
 _SESSION_START_WINDOW_S = 60.0

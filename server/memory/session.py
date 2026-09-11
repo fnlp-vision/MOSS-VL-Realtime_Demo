@@ -33,7 +33,8 @@ from . import inject as inject_mod
 from . import lang as lang_mod
 from . import rewrite as rewrite_mod
 from .pi_client import PiAgentClient
-from .retrieval import Candidate, Retriever
+from .lifecycle import SessionLifetime, while_open
+from .retrieval import Candidate, Retriever, has_past_reference
 from .store import KIND_FRAME, KIND_UTTERANCE, MemoryStore
 from .writer import MemoryWriter
 
@@ -72,6 +73,7 @@ class RecallResult:
     # MEMORY_INJECT_FRAMES — a matched frame with no caption is worth nothing as
     # text, so either the pixels come back or the frame is not recalled at all.
     frames: List[bytes] = field(default_factory=list)
+    reason: Optional[str] = None
 
     def __bool__(self) -> bool:
         return bool(self.block)
@@ -92,6 +94,9 @@ class MemorySession:
                  writer: MemoryWriter, *, default_lang: str = "zh", facts: Any = None) -> None:
         self.conversation_id = conversation_id
         self.settings = settings
+        self.lifetime = SessionLifetime()
+        self._close_lock = threading.Lock()
+        self._cleaned = False
         self.store = store
         self.writer = writer
         self.retriever = Retriever(store, writer.text, writer.image, settings)
@@ -100,6 +105,7 @@ class MemorySession:
         self.lang_state = lang_mod.LanguageState(default=default_lang)
         self._t0 = time.monotonic()
         self._injected: Dict[int, _InjectedEntry] = {}
+        self._native_context: Set[Tuple[str, str]] = set()
         self._suppressed: Set[int] = set()
         self._last_frame_at = 0.0
         self._prefetch: Optional[Tuple[str, List[Candidate]]] = None
@@ -137,6 +143,7 @@ class MemorySession:
 
     # ---- write path (all non-blocking) ----
 
+    @while_open()
     def note_user_turn(self, text: str, *, media_ts: Optional[float] = None,
                        session_ts: Optional[float] = None) -> None:
         text = (text or "").strip()
@@ -147,8 +154,10 @@ class MemorySession:
         self.writer.note_utterance(
             self.conversation_id, "user", text,
             lang=lang_mod.detect_lang(text, default=self.language),
-            session_ts=self.session_ts(session_ts), media_ts=media_ts, importance=0.65)
+            session_ts=self.session_ts(session_ts), media_ts=media_ts, importance=0.65,
+            lifetime=self.lifetime)
 
+    @while_open()
     def note_assistant_turn(self, text: str, *, media_ts: Optional[float] = None,
                             commit: bool = True) -> None:
         text = (text or "").strip()
@@ -165,13 +174,15 @@ class MemorySession:
         self.writer.note_utterance(
             self.conversation_id, "assistant", text,
             lang=lang_mod.detect_lang(text, default=self.language),
-            session_ts=self.session_ts(), media_ts=media_ts, importance=0.4)
+            session_ts=self.session_ts(), media_ts=media_ts, importance=0.4,
+            lifetime=self.lifetime)
 
     def uncommitted_turns(self) -> List[Tuple[str, str]]:
         """(role, text) interrupted turns kept as compact context only."""
         with self._lock:
             return list(self._uncommitted)
 
+    @while_open()
     def note_frame(self, jpeg: bytes, timestamp: Optional[float] = None,
                    media_ts: Optional[float] = None) -> None:
         """Hot-path throttle only — real dedup happens on the writer thread."""
@@ -180,10 +191,11 @@ class MemorySession:
             return
         self._last_frame_at = now
         self.writer.note_frame(self.conversation_id, jpeg, session_ts=self.session_ts(timestamp),
-                               media_ts=media_ts, lang=self.language)
+                               media_ts=media_ts, lang=self.language, lifetime=self.lifetime)
 
     # ---- read path ----
 
+    @while_open()
     def prefetch(self, partial_text: str) -> None:
         """Best-effort warm-up from an ASR partial. Never raises, never gates."""
         text = (partial_text or "").strip()
@@ -255,12 +267,16 @@ class MemorySession:
         if pi is None or not pi.reachable():
             return True
         if max((c.raw for c in candidates), default=0.0) < self._prefilter_gate(query):
+            log.info("memory recall session=%s stage=prefilter rejected threshold=%.3f best=%.3f",
+                     self.conversation_id, self._prefilter_gate(query),
+                     max((c.raw for c in candidates), default=0.0))
             return False
         decision = pi.decide(self.conversation_id, self._recent_turns_text(), query)
         if decision is None:
             return True
         return bool(decision.get("retrieve"))
 
+    @while_open(EMPTY_RECALL)
     def recall_for_turn(self, text: str, *, now_tokens: Optional[float] = None) -> RecallResult:
         """Blocking (call via to_thread): rewrite → search → rank → time window
         → re-injection distance gate → diversify → admission gate → format.
@@ -273,33 +289,43 @@ class MemorySession:
         if self._lifetime_tokens >= max(1, int(self.settings.memory_inject_session_max_tokens)):
             # lifetime budget exhausted: stop recalling SILENTLY — this is a
             # rollover signal, not a reason to raise the cap (design §5)
+            log.info("memory recall session=%s stage=lifetime_budget exhausted", self.conversation_id)
             return EMPTY_RECALL
         if now_tokens is not None:
             # the worker's exact count supersedes the estimate, never rewinds it
             self._est_tokens = max(self._est_tokens, float(now_tokens))
         self._pending_block_tokens = 0
         try:
+            decision_started = time.monotonic()
             search_q, window = self._prepare_query(query)
             mode = (self.settings.memory_decision_mode or "vector").strip().lower()
-            if mode == "llm":
+            # Explicit history requests need query resolution BEFORE score gating.
+            # Keep final evidence admission and KV de-duplication below unchanged.
+            decision_first = mode == "llm" or (mode == "hybrid" and has_past_reference(query))
+            if decision_first:
                 # pi /decide gates the whole turn; a retrieve=false verdict
                 # skips recall, a query rewrite overrides the search query
                 decision = self._pi_decide(query)
                 if decision is not None:
                     if not decision.get("retrieve"):
+                        log.info("memory recall session=%s stage=decision rejected", self.conversation_id)
                         self.stats["gated_out"] += 1
                         return EMPTY_RECALL
                     override = str(decision.get("query") or "").strip()
                     if override:
                         search_q = override
             candidates = self._candidates(search_q)
+            log.info("memory recall session=%s stage=search rewritten=%s candidates=%s",
+                     self.conversation_id, search_q != query,
+                     [(c.item.id, c.space, round(c.raw, 3)) for c in candidates])
             if not candidates:
                 return EMPTY_RECALL
-            if mode == "hybrid" and not self._hybrid_decide(query, candidates):
+            if mode == "hybrid" and not decision_first and not self._hybrid_decide(query, candidates):
                 self.stats["gated_out"] += 1
                 return EMPTY_RECALL
             candidates = self._time_gate(candidates, window)
-            candidates = self._distance_gate(candidates, self._est_tokens)
+            log.info("memory recall session=%s stage=time window=%s ids=%s",
+                     self.conversation_id, window, [c.item.id for c in candidates])
             if not candidates:
                 self.stats["gated_out"] += 1
                 return EMPTY_RECALL
@@ -307,11 +333,47 @@ class MemorySession:
             # diversify/gate read the RAW query — the augmentation is search-only
             diverse = self.retriever.diversify(candidates, query, limit=limit)
             keep = self.retriever.gate(query, diverse)
+            verified_empty = False
+            if mode == 'hybrid':
+                # Already-present context is evidence too; it must be examined
+                # before deciding that a textual history question has no answer.
+                contextual = self.store.recent(self.conversation_id, [KIND_UTTERANCE], limit=8)
+                contextual += list(self.store.get_items(list(self._injected)).values())
+                seen = {c.item.id for c in keep}
+                for item in contextual:
+                    if len(keep) >= 16:
+                        break
+                    if item.id not in seen and ((item.role, item.text.strip()) in self._native_context or item.id in self._injected):
+                        keep.append(Candidate(item, relevance=0.0))
+                        seen.add(item.id)
+            if mode == "hybrid" and keep and self._pi is not None and self._pi.reachable():
+                remaining = float(self.settings.memory_pi_decide_timeout_s) - (time.monotonic() - decision_started)
+                selected = self._pi.select(query, [
+                    {"id": c.item.id, "role": c.item.role, "session_ts": c.item.session_ts,
+                     "text": (c.item.text or "")[:2000]}
+                    for c in keep], timeout_s=remaining, recent_turns=self._recent_turns_text())
+                if selected is None:
+                    # Old/unavailable sidecars retain the original conservative prefilter.
+                    keep = [c for c in keep if c.raw >= self._prefilter_gate(query)]
+                else:
+                    verified_empty = not selected
+                    keep = [c for c in keep if c.item.id in selected]
+                log.info("memory recall session=%s stage=evidence available=%s ids=%s",
+                         self.conversation_id, selected is not None, [c.item.id for c in keep])
+            # Select the right evidence before suppressing copies already in KV.
+            # Removing a retained correction first can promote an obsolete fact.
+            keep = self._distance_gate(keep, self._est_tokens)
+            log.info("memory recall session=%s stage=context ids=%s",
+                     self.conversation_id, [c.item.id for c in keep])
+            log.info("memory recall session=%s stage=admission diverse=%s kept=%s",
+                     self.conversation_id, [c.item.id for c in diverse], [c.item.id for c in keep])
             self.stats["recalls"] += 1
             if not keep:
                 self.stats["gated_out"] += 1
-                return EMPTY_RECALL
-            return self._format(keep)
+                return RecallResult('', [], [], reason='no_evidence') if verified_empty else EMPTY_RECALL
+            result = self._format(keep)
+            log.info("memory recall session=%s stage=format ids=%s", self.conversation_id, result.ids)
+            return result
         except Exception as exc:  # noqa: BLE001 — memory never breaks a turn
             log.warning("memory recall failed: %s", exc)
             return EMPTY_RECALL
@@ -361,6 +423,8 @@ class MemorySession:
         distance = max(0, int(self.settings.memory_reinject_distance))
         out: List[Candidate] = []
         for cand in candidates:
+            if (cand.item.role, (cand.item.text or '').strip()) in self._native_context:
+                continue
             entry = self._injected.get(cand.item.id)
             if entry is None:
                 out.append(cand)
@@ -418,14 +482,27 @@ class MemorySession:
         return RecallResult(block=block, items=items, ids=ids, frames=frames)
 
     def _load_frame(self, media_hash: Optional[str]) -> Optional[bytes]:
+        if media_hash and media_hash.startswith('memory:'):
+            try:
+                return self.store.frames.load(self.conversation_id, media_hash)
+            except Exception:
+                return None
         media = getattr(self.writer, "media", None)
         if not media_hash or media is None:
             return None
         try:
-            return media.load_bytes(media_hash)
+            if hasattr(media, 'load_bytes'):
+                return media.load_bytes(media_hash)
+            from ..persistence.media import normalize_hash
+            digest = normalize_hash(media_hash)
+            if digest is not None:
+                with open(media.blob_path(digest), 'rb') as stream:
+                    return stream.read()
+            return None
         except Exception:  # noqa: BLE001
             return None
 
+    @while_open()
     def mark_injected(self, ids: Sequence[int], *, text_tokens: Optional[float] = None) -> None:
         """Commit an injected block: bump each item's copy count, stamp the
         text-KV position it was shown at, and fold the block's estimated tokens
@@ -450,6 +527,13 @@ class MemorySession:
             self._est_tokens = max(self._est_tokens, pos) + block_tokens
             self.stats["injected"] += len(ids)
 
+    @while_open()
+    def note_context_turn(self, role: str, text: str) -> None:
+        """Called only after model input acknowledgement or completed output."""
+        if text and text.strip():
+            self._native_context.add((role, text.strip()))
+
+    @while_open()
     def note_rollover(self, kept_item_ids: Sequence[int], *, text_tokens: float = 0.0) -> None:
         """Re-seat after a KV rollover (the rollover machinery itself is a
         separate workstream): the injected table is recomputed from EXACTLY the
@@ -461,6 +545,7 @@ class MemorySession:
         """
         self._injected = {int(i): _InjectedEntry(copies=1, last_tokens=float(text_tokens))
                           for i in kept_item_ids}
+        self._native_context.clear()
         self._est_tokens = max(0.0, float(text_tokens))
         self._pending_block_tokens = 0
         with self._lock:
@@ -468,12 +553,14 @@ class MemorySession:
             # the new prefix already carries it — start fresh
             self._uncommitted.clear()
 
+    @while_open()
     def suppress(self, ids: Sequence[int]) -> None:
         """User said 'not that one' — stop surfacing these for this session."""
         self._suppressed.update(int(i) for i in ids)
 
     # ---- background fact extraction (never on the hot path) ----
 
+    @while_open()
     async def maybe_extract_facts(self, item_id: Optional[int], user_text: str,
                                   context_turns: Optional[Sequence[str]] = None) -> None:
         """Fire-and-forget from the orchestrator once an assistant reply
@@ -490,12 +577,12 @@ class MemorySession:
         try:
             if item_id is None:
                 item_id = await self._resolve_user_item(text)
-            if item_id is None:
+            if item_id is None or self.lifetime.closing:
                 return
             if context_turns is None:
                 context_turns = await asyncio.to_thread(self._recent_context, int(item_id))
             await extractor.extract_and_rekey(self.conversation_id, int(item_id), text,
-                                              context_turns)
+                                              context_turns, lifetime=self.lifetime)
         except Exception as exc:  # noqa: BLE001 — memory must never kill a session
             log.debug("memory fact extraction failed: %s", exc)
 
@@ -504,6 +591,8 @@ class MemorySession:
         owns inserts, so the row lands a few ms after note_user_turn — a short
         poll beats wiring row ids back through the enqueue-only hot path."""
         for _ in range(30):
+            if self.lifetime.closing:
+                return None
             found = await asyncio.to_thread(self._find_user_item, text)
             if found is not None:
                 return found
@@ -530,9 +619,34 @@ class MemorySession:
 
     # ---- lifecycle ----
 
+    @while_open(True)
+    def has_history(self) -> bool:
+        """Conservative absence check: pending/native context also counts."""
+        return bool(self._native_context or self._injected or self._uncommitted or
+                    self.store.count(self.conversation_id))
+
+    @while_open(True)
+    def has_dialogue_history(self) -> bool:
+        return bool(self._native_context or self._injected or self._uncommitted or
+                    self.store.recent(self.conversation_id, [KIND_UTTERANCE], limit=1))
+
     def close(self) -> None:
-        self.writer.forget(self.conversation_id)
-        self.store.forget_session_cache(self.conversation_id)
+        self.lifetime.seal()
+        with self._close_lock:
+            if self._cleaned:
+                return
+            self.writer.discard_session(self.conversation_id, self.lifetime)
+            self.lifetime.wait()
+            self.writer.forget(self.conversation_id)
+            with self._lock:
+                self._prefetch = None
+                self._uncommitted.clear()
+                self._injected.clear()
+                self._native_context.clear()
+                self._suppressed.clear()
+            count = self.store.delete_session(self.conversation_id)
+            self._cleaned = True
+            log.info("memory session cleaned: %s (%d items)", self.conversation_id, count)
 
     def status(self) -> Dict[str, Any]:
         return {"items": self.store.count(self.conversation_id),

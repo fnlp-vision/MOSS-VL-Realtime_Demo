@@ -9,6 +9,7 @@
 import http from "node:http";
 import { ensureNoProxy, getApiKey } from "./aigw.mjs";
 import { decide } from "./decide.mjs";
+import { selectEvidence } from "./select.mjs";
 import { compactJournal } from "./compact.mjs";
 import { readiness } from "./readiness.mjs";
 import { withDeadline } from "./deadline.mjs";
@@ -127,6 +128,16 @@ const server = http.createServer(async (req, res) => {
         pendingUserText: textField(body, "pending_user_text"),
       }));
       console.log(`[pi_agent] /decide mode=${mode()} retrieve=${result.retrieve} ${Date.now() - t0}ms`);
+      sendJson(res, 200, result);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/select") {
+      const body = await parseJsonBody(req);
+      const result = await run(Number(process.env.PI_DECIDE_TIMEOUT_MS || 20000), () =>
+        selectEvidence({ query: textField(body, "query"), candidates: body.candidates,
+                         recentTurns: textField(body, "recent_turns") }));
+      console.log(`[pi_agent] /select selected=${result.ids.length}`);
       sendJson(res, 200, result);
       return;
     }

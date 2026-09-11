@@ -19,6 +19,7 @@ here may run on the hot path — the orchestrator fires and forgets.
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import re
 from typing import Any, List, Optional, Sequence
 
@@ -83,15 +84,17 @@ class FactExtractor:
             return False
 
     async def extract_and_rekey(self, conversation_id: str, item_id: int, user_text: str,
-                                context_turns: Optional[Sequence[str]] = None
+                                context_turns: Optional[Sequence[str]] = None, *, lifetime: Any = None
                                 ) -> Optional[str]:
         """Extract facts for one user turn and re-embed its vectors on the key.
         Returns the key, or None on any failure — the item then simply keeps
         retrieving on its raw text, which is the safe degradation."""
         text = (user_text or "").strip()
-        if not text or not self.available():
+        if not text or not self.available() or (lifetime is not None and lifetime.closing):
             return None
         async with self.semaphore:
+            if lifetime is not None and lifetime.closing:
+                return None
             try:
                 facts = await self._extract(text, context_turns or [])
             except Exception as exc:  # noqa: BLE001
@@ -101,7 +104,7 @@ class FactExtractor:
                 return None
             key = f"{text} {' '.join(facts)}"
             try:
-                await asyncio.to_thread(self._rekey, conversation_id, item_id, key)
+                await asyncio.to_thread(self._rekey, conversation_id, item_id, key, lifetime=lifetime)
             except Exception as exc:  # noqa: BLE001
                 log.debug("memory fact rekey failed: %s", exc)
                 return None
@@ -118,10 +121,17 @@ class FactExtractor:
             parts.append(delta)
         return parse_facts("".join(parts))
 
-    def _rekey(self, conversation_id: str, item_id: int, key: str) -> None:
+    def _rekey(self, conversation_id: str, item_id: int, key: str, *, lifetime: Any = None) -> None:
+        with lifetime.operation() if lifetime is not None else nullcontext(True) as admitted:
+            if admitted:
+                self._rekey_open(conversation_id, item_id, key)
+
+    def _rekey_open(self, conversation_id: str, item_id: int, key: str) -> None:
         """Replace the item's vectors with encodings of the KEY and persist the
         key for audit. `memory_items.text` is deliberately untouched — the raw
         verbatim turn is what retrieval returns."""
+        if not self.store.accepting_writes:
+            return
         embedder = self.writer.text
         self.store.update_vector(conversation_id, item_id, SPACE_TEXT, embedder.encode([key])[0])
         encode_tokens = getattr(embedder, "encode_tokens", None)
@@ -132,7 +142,7 @@ class FactExtractor:
                                          encode_tokens([key])[0])
             except Exception as exc:  # noqa: BLE001 — pooled rekey already landed
                 log.debug("memory fact rekey (late) failed: %s", exc)
-        self.store.put_key(item_id, key)
+        self.store.put_key(item_id, key, conversation_id=conversation_id)
 
 
 def build_fact_extractor(settings: Settings, store: Optional[MemoryStore],

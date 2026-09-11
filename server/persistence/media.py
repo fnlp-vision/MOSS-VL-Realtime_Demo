@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -313,22 +314,17 @@ class MediaStore:
 
     def delete_blob(self, hex_: str) -> None:
         """Remove a blob + its derivatives (prune tool; row deletion is the index's)."""
-        for path in (self.blob_path(hex_),):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        if normalize_hash(hex_) != hex_:
+            raise ValueError('invalid media hash')
+        try:
+            os.unlink(self.blob_path(hex_))
+        except FileNotFoundError:
+            pass
         d = self._derived_dir_for(hex_)
-        if os.path.isdir(d):
-            for name in os.listdir(d):
-                try:
-                    os.unlink(os.path.join(d, name))
-                except OSError:
-                    pass
-            try:
-                os.rmdir(d)
-            except OSError:
-                pass
+        try:
+            shutil.rmtree(d)
+        except FileNotFoundError:
+            pass
 
 
 # ---- process-global accessor (mirrors deps.set_runtime; lets the VLM adapter

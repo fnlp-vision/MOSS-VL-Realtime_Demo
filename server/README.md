@@ -167,6 +167,79 @@ Persistence knobs: `HISTORY_ENABLED`/`MEDIA_ENABLED` (both default 1), `DATA_DIR
 
 ## History + media store (`server/persistence/`)
 
+Runtime retrieval memory has a separate lifecycle from these archives. On final
+session close (explicit close or reconnect-grace expiry), the gateway rejects
+new memory work, waits for admitted worker operations, and deletes that session's
+rows, vectors, index keys, and RAM caches from `memory.db`. Detaching a socket
+within its reconnect grace period does not clear memory. Cleanup is idempotent;
+failures are logged and raised rather than reported as successful cleanup.
+
+The initial system prompt remains the model default or the user's original
+prompt; memory does not append instructions to it. Candidate verification considers recent corrections before context
+deduplication; acknowledged user input and completed assistant output are also
+tracked as already present in the current context. Rollover resets that tracking
+to the content actually retained. A selected still image remains valid until the
+source changes; camera/screen frames retain their normal freshness limit.
+
+With the default system prompt and no initial task, an explicit history question
+with no prior records produces `memory.notice {code: "no_history", message: "..."}`.
+A history query may instead produce `code: "no_evidence"` when candidate
+verification finds no supporting evidence. Verification failures and context
+deduplication do not trigger this notice. The client displays and archives notices
+as system messages, not model answers. Each notice includes a `response_id` and
+is followed by `response.created`, empty `response.text.done`, and `response.done`
+with `source: "system"`. Ordinary questions still go to the model.
+Deploy the updated frontend and API together.
+
+On context rollover, the gateway probes `/v1/video/realtime/capabilities` and uses
+role-preserving `prefill_messages` when supported. Update the realtime backend
+alongside the gateway to enable this path. Older backends receive the legacy
+text prompt without unsupported fields; they cannot preserve native history roles.
+
+New memory keyframes live in session-private directories beside the memory DB
+(`memory.db.frames/`), not in the history CAS. Closing a session removes its
+temporary frames; history journals, uploads and shared model weights remain.
+The gateway holds an exclusive process lock on its memory DB. API instances
+must use separate memory DB paths; do not remove lock files to bypass ownership.
+
+Startup recovers owned sessions left by a previous process. Failed cleanup stays
+in a persistent retry queue and is retried every `MEMORY_MAINTENANCE_INTERVAL_S`
+(default 30 seconds). Pre-upgrade records without ownership metadata require
+explicit offline migration and are not automatically deleted.
+
+`MEMORY_MIN_FREE_BYTES` (default 1 GiB) and `MEMORY_MAX_DB_BYTES` (default 2 GiB
+of occupied SQLite pages) pause new memory writes under storage pressure; normal
+inference continues. The DB limit is a soft admission bound, not a filesystem
+quota or a cap on media size. Admission resumes after the next successful check.
+Filesystem capacity checks run in periodic maintenance, outside the retrieval
+database lock; individual writes use the cached admission state. Online
+maintenance checkpoints the WAL without a full vacuum. Freed DB pages
+are reusable; use offline vacuum when physical file shrinkage is required.
+
+Preview runtime-memory cleanup (read-only by default):
+
+```bash
+.venv/bin/python scripts/memory_maint.py --db data/memory.db
+```
+
+After stopping every API that uses the database, migrate old records and reclaim
+space. This creates a database backup before deletion; it does not back up or
+delete shared CAS uploads. The backup itself needs disk space and should be
+retained or removed according to your operational retention policy.
+
+```bash
+.venv/bin/python scripts/memory_maint.py --db data/memory.db --apply --offline --include-legacy --vacuum
+```
+
+Legacy shared-media cleanup remains a separate offline operation. The pruner
+checks both history references and remaining memory references; failed file
+deletion does not remove the corresponding media index row.
+
+```bash
+.venv/bin/python scripts/history_prune.py --unreferenced --dry-run
+.venv/bin/python scripts/history_prune.py --unreferenced --offline --older-than 1
+```
+
 Two durable archives under `DATA_DIR` — nothing auto-evicts:
 
 - **History**: append-only JSONL journal (`journal/YYYY/MM/<cid>.jsonl`, the source
@@ -193,9 +266,9 @@ connection + journal appends (producers only enqueue); media ingest runs via
 `asyncio.to_thread`. Maintenance (backend stopped):
 
 ```bash
-.venv/bin/python scripts/history_prune.py --unreferenced [--older-than 30]  # GC unref'd blobs
-.venv/bin/python scripts/history_prune.py --drop-conversations --older-than 90
-.venv/bin/python scripts/history_prune.py --rebuild   # index.db from journals + blob scan
+.venv/bin/python scripts/history_prune.py --unreferenced --offline [--older-than 30]  # GC unref'd blobs
+.venv/bin/python scripts/history_prune.py --drop-conversations --older-than 90 --offline
+.venv/bin/python scripts/history_prune.py --rebuild --offline   # index.db from journals + blob scan
 ```
 
 ## Layout

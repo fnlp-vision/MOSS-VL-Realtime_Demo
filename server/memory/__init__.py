@@ -26,6 +26,7 @@ from ..logging_conf import get_logger
 from .session import EMPTY_RECALL, MemorySession, RecallResult
 from .store import MemoryStore
 from .writer import MemoryWriter
+from .frames import SessionFrames
 
 log = get_logger(__name__)
 
@@ -39,6 +40,8 @@ def build_memory(settings: Settings, media: Any = None):
         return None, None
     try:
         store = MemoryStore(settings)
+        if settings.media_enabled:
+            store.frames = SessionFrames(store.path)
         writer = MemoryWriter(settings, store, media=media)
         return store, writer
     except Exception as exc:  # noqa: BLE001 — never block boot on memory

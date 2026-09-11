@@ -181,6 +181,8 @@ class Orchestrator:
         # latest user turn awaiting background fact extraction; consumed when
         # the assistant reply that answers it finalizes (memory, design §3)
         self._pending_fact_user_text: Optional[str] = None
+        self._memory_tasks: set[asyncio.Task] = set()
+        self._close_task: Optional[asyncio.Task] = None
 
         # ---- response / TTS lanes ----
         # live responses (typically ≤2: one finalized-and-draining-audio + the
@@ -235,19 +237,28 @@ class Orchestrator:
                 self._vlm_drain_task = task
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        for task in self._tasks:
-            task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
+        if self._close_task is None:
+            self._closed = True
+            lifetime = getattr(self.memory, "lifetime", None)
+            if lifetime is not None:
+                lifetime.seal()
+            if self._rollover is not None and hasattr(self._rollover, "seal"):
+                self._rollover.seal()
+            self._close_task = asyncio.create_task(self._close_impl())
+        try:
+            await asyncio.shield(self._close_task)
+        except Exception:
+            self._close_task = None  # cleanup errors remain visible and retryable
+            raise
 
-        if self.memory is not None:
-            try:
-                self.memory.close()  # frees this session's in-RAM vector matrices
-            except Exception:  # noqa: BLE001
-                pass
+    async def _close_impl(self) -> None:
+        tasks = [*self._tasks, *self._memory_tasks]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+        self._memory_tasks.clear()
+
         stream, self._asr_stream = self._asr_stream, None
         if stream is not None:
             try:
@@ -263,6 +274,16 @@ class Orchestrator:
             await asyncio.to_thread(self.engines.vlm.stop, 5.0)
         except Exception:  # noqa: BLE001
             pass
+        if self._rollover is not None and hasattr(self._rollover, "close"):
+            await asyncio.to_thread(self._rollover.close)
+        if self.memory is not None:
+            try:
+                await asyncio.to_thread(self.memory.close)
+            except Exception:
+                log.exception("memory cleanup failed for %s", self.state.session_id)
+                raise
+        self._latest_frame = None
+        self._pending_fact_user_text = None
         log.info("orchestrator closed for %s (metrics=%s)", self.state.session_id, self.metrics)
 
     # ------------------------------------------------------------------ ingress (from the WS router)
@@ -406,6 +427,7 @@ class Orchestrator:
             except (TypeError, ValueError):
                 pass
         self._segment = seg
+        self._latest_frame = None  # wait for a frame from the newly selected source
         self._pending_source_notes.append(self._source_note(seg))
         del self._pending_source_notes[:-3]  # a swap-spam burst keeps the last 3
         self.state.emit(p.VIDEO_SOURCE_CHANGED, item_id=f"item_{next(self._serial)}", **seg)
@@ -671,10 +693,37 @@ class Orchestrator:
             self._emit_error("vlm_unavailable", "the realtime model loop is not running")
             return
 
+        if self.memory is not None and not (self.state.config.initial_prompt or self.settings.initial_prompt):
+            from ..memory.retrieval import is_history_question, refers_to_dialogue
+            from ..memory.rollover import _default_system_prompt
+            default_system = not self.state.config.system_prompt or self.state.config.system_prompt.strip() == _default_system_prompt().strip()
+            history_check = self.memory.has_dialogue_history if refers_to_dialogue(text) else self.memory.has_history
+            if default_system and is_history_question(text) and not await asyncio.to_thread(history_check):
+                if self._closed:
+                    return
+                message = ('当前会话还没有可供核对的早前记录，无法确认。请先提供相关信息。'
+                           if self.memory.language.startswith('zh') else
+                           'This session has no history to consult. Please provide the relevant information first.')
+                self._emit_memory_notice(text, 'no_history', message)
+                return
+
         # buffered source-change timeline notes ride the MODEL text only — the
         # clean `text` was already echoed to transcript/journal by the caller
         notes, self._pending_source_notes = self._pending_source_notes, []
         recall = await self._recall_for_turn(text)
+        if self._closed:
+            return
+        if (self.memory is not None and getattr(recall, 'reason', None) == 'no_evidence'
+                and not (self.state.config.initial_prompt or self.settings.initial_prompt)):
+            from ..memory.retrieval import is_history_question
+            from ..memory.rollover import _default_system_prompt
+            if is_history_question(text) and (not self.state.config.system_prompt or self.state.config.system_prompt.strip() == _default_system_prompt().strip()):
+                message = ('本轮没有找到可核对的历史依据，无法确认。'
+                           if self.memory.language.startswith('zh') else
+                           'No supporting history was found for this question.')
+                self._emit_memory_notice(text, 'no_evidence', message)
+                self._pending_source_notes = notes + self._pending_source_notes
+                return
         # user text is sanitized because split_special_tokens=False: a literal
         # `<think>` or `<|im_end|>` in ASR/typed input would otherwise tokenize
         # as a real control token and corrupt the chat scaffold
@@ -686,7 +735,9 @@ class Orchestrator:
 
         frame = None
         latest = self._latest_frame
-        if latest is not None and (time.monotonic() - latest[2]) <= self.settings.frame_max_age_s:
+        source = (self._segment or {}).get('kind', self.state.config.video_source)
+        if latest is not None and (source == 'image' or
+                                   (time.monotonic() - latest[2]) <= self.settings.frame_max_age_s):
             frame = latest
         for attempt in range(2):
             try:
@@ -695,6 +746,8 @@ class Orchestrator:
                         self.engines.vlm.put_prompt_frame, vlm_text, frame[0], frame[1], len(frame[0]), True)
                 else:
                     await asyncio.to_thread(self.engines.vlm.put_prompt, vlm_text)
+                if self.memory is not None:
+                    self.memory.note_context_turn('user', text)
                 break
             except Exception as exc:
                 if type(exc).__name__ == "ContextRolloverRequired" and attempt == 0:
@@ -709,6 +762,17 @@ class Orchestrator:
                 else:
                     self._mark_vlm_dead(f"prompt failed: {exc}")
 
+    def _emit_memory_notice(self, text: str, code: str, message: str) -> None:
+        response_id = f'resp_{next(self._serial)}'
+        self.state.emit(p.MEMORY_NOTICE, response_id=response_id, code=code, message=message)
+        self.state.emit(p.RESPONSE_CREATED, response_id=response_id, source='system')
+        self.state.emit(p.RESPONSE_TEXT_DONE, response_id=response_id, source='system', text='')
+        self.state.emit(p.RESPONSE_DONE, response_id=response_id, source='system', stop_reason=p.STOP_END_TURN)
+        self._note_memory_turn('user', text)
+        self._pending_turn_t0 = None
+        self._pending_fact_user_text = None
+        self.metrics['memory_notices'] = self.metrics.get('memory_notices', 0) + 1
+
     async def _recall_for_turn(self, text: str):
         """Retrieve → gate → format, off the event loop. Never raises."""
         if self.memory is None:
@@ -720,6 +784,8 @@ class Orchestrator:
                 self.memory.recall_for_turn, text, now_tokens=self._last_text_tokens)
         except Exception as exc:  # noqa: BLE001
             log.debug("memory recall failed: %s", exc)
+            return mem_session.EMPTY_RECALL
+        if self._closed:
             return mem_session.EMPTY_RECALL
         if recall:
             # channel V: a recalled frame re-enters through the normal frame
@@ -734,6 +800,8 @@ class Orchestrator:
             # re-injection is distance-gated inside the session (design §5);
             # the client gets an itemized event so recall is visible/auditable,
             # never ambient
+            if self._closed:
+                return mem_session.EMPTY_RECALL
             self.memory.mark_injected(recall.ids, text_tokens=self._last_text_tokens)
             self.state.emit(p.MEMORY_RECALLED, items=recall.items)
             log.info("memory: recalled %d item(s) for %s", len(recall.ids), self.state.session_id)
@@ -750,6 +818,8 @@ class Orchestrator:
                 # commit=False (barge-in / <|eot_id|> interrupted): the text stays
                 # as compact-journal context but never enters long-term memory
                 self.memory.note_assistant_turn(text, media_ts=media_ts, commit=commit)
+                if commit:
+                    self.memory.note_context_turn('assistant', text)
         except Exception as exc:  # noqa: BLE001
             log.debug("memory note_turn failed: %s", exc)
 
@@ -757,14 +827,16 @@ class Orchestrator:
         """A finalized assistant reply closes a QA pair — the segment boundary
         for background fact extraction (memory, design §3). Fire-and-forget:
         never awaited, never allowed to raise on the hot path."""
-        if self.memory is None:
+        if self.memory is None or self._closed:
             return
         user_text, self._pending_fact_user_text = self._pending_fact_user_text, None
         if not user_text:
             return
         try:
-            asyncio.get_running_loop().create_task(
+            task = asyncio.get_running_loop().create_task(
                 self.memory.maybe_extract_facts(None, user_text, None))
+            self._memory_tasks.add(task)
+            task.add_done_callback(self._memory_tasks.discard)
         except Exception as exc:  # noqa: BLE001
             log.debug("memory facts schedule failed: %s", exc)
 
@@ -1373,6 +1445,8 @@ class Orchestrator:
                 old_stopped = True
                 await asyncio.to_thread(old.stop, 5.0)
             prefill, kept_ids, est_tokens = await self._rollover.build_prefix()
+            if self._closed:
+                return
             prefill_json = json.dumps(prefill, ensure_ascii=False)
             log.info("rollover (%s) for %s: prefix ~%d est tokens, %d kept items, %d messages",
                      trigger, self.state.session_id, est_tokens, len(kept_ids), len(prefill))

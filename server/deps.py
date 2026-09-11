@@ -70,6 +70,8 @@ class Runtime:
         # L2 memory plane (server/memory/); (None, None) unless MEMORY_ENABLED.
         # Shared across sessions — per-session state lives in MemorySession.
         self.memory_store, self.memory_writer = build_memory(settings, media=self.media)
+        from .memory.maintenance import MemoryMaintenance
+        self.memory_maintenance = MemoryMaintenance(self.memory_store) if self.memory_store is not None else None
         # fact extraction (memory/facts.py) rides the offline sglang plane and
         # holds the semaphore future summary jobs will share; getattr because
         # tests build partial Runtimes via Runtime.__new__
@@ -92,6 +94,8 @@ class Runtime:
     # ---- lifecycle (blocking; run via asyncio.to_thread in lifespan) ----
 
     def open_persistence(self) -> None:
+        if getattr(self, 'memory_maintenance', None) is not None:
+            self.memory_store.open()  # fail ownership checks before opening any archive writers
         if self.index is not None:
             self.index.open()
         if self.media is not None:
@@ -101,6 +105,8 @@ class Runtime:
             self.history.open()
         # getattr: tests build partial Runtimes via Runtime.__new__
         if getattr(self, "memory_writer", None) is not None:
+            if getattr(self, 'memory_maintenance', None) is not None:
+                self.memory_maintenance.start()
             self.memory_writer.start()  # opens the store on its own thread
             # eager embedder load (still off-loop here): the first live turn
             # must not pay the BGE-M3/Chinese-CLIP weight load on recall
@@ -111,6 +117,8 @@ class Runtime:
             # Embeddings execute native code; never close their stores while a
             # worker still owns an in-flight job, even when shutdown is slow.
             self.memory_writer.stop(timeout=None)
+        if getattr(self, 'memory_maintenance', None) is not None:
+            self.memory_maintenance.stop()
         set_media_store(None)
         if getattr(self, "memory_store", None) is not None:
             self.memory_store.close()

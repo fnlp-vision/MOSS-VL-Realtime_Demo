@@ -120,7 +120,8 @@ class MemoryWriter:
 
     def _put(self, job: Dict[str, Any], *, droppable: bool) -> bool:
         with self._lifecycle_lock:
-            if self._stopping:
+            lifetime = job.get("lifetime")
+            if self._stopping or not self.store.accepting_writes or (lifetime is not None and lifetime.closing):
                 return False
             try:
                 self._q.put_nowait(job)
@@ -146,12 +147,12 @@ class MemoryWriter:
 
     def note_utterance(self, conversation_id: str, role: str, text: str, *, lang: str,
                        session_ts: Optional[float] = None, media_ts: Optional[float] = None,
-                       importance: float = 0.5) -> bool:
+                       importance: float = 0.5, lifetime: Any = None) -> bool:
         text = (text or "").strip()
         if not text:
             return False
         with self._lifecycle_lock:
-            if self._stopping:
+            if self._stopping or (lifetime is not None and lifetime.closing):
                 return False
             if not self._mark_utterance_seen(conversation_id, role, text):
                 log.debug("dropped duplicate %s utterance for %s: %r",
@@ -159,7 +160,7 @@ class MemoryWriter:
                 return True
             accepted = self._put({"t": "utterance", "conv": conversation_id, "role": role, "text": text,
                        "lang": lang, "session_ts": session_ts, "media_ts": media_ts,
-                       "importance": importance}, droppable=False)
+                       "importance": importance, "lifetime": lifetime}, droppable=False)
             if not accepted:
                 with self._seen_lock:
                     self._seen_utterances[str(conversation_id)].discard(
@@ -167,11 +168,11 @@ class MemoryWriter:
             return accepted
 
     def note_frame(self, conversation_id: str, jpeg: bytes, *, session_ts: Optional[float] = None,
-                   media_ts: Optional[float] = None, lang: str = "zh") -> None:
+                   media_ts: Optional[float] = None, lang: str = "zh", lifetime: Any = None) -> None:
         if not jpeg:
             return
         self._put({"t": "frame", "conv": conversation_id, "jpeg": jpeg, "lang": lang,
-                   "session_ts": session_ts, "media_ts": media_ts}, droppable=True)
+                   "session_ts": session_ts, "media_ts": media_ts, "lifetime": lifetime}, droppable=True)
 
     # ---- consumer ----
 
@@ -187,10 +188,21 @@ class MemoryWriter:
                     self._wakeup.clear()
                     continue
             try:
-                self._handle(job)
+                lifetime = job.get("lifetime")
+                if not self.store.accepting_writes:
+                    self.stats['dropped'] += 1
+                    continue
+                if lifetime is None:
+                    self._handle(job)
+                else:
+                    with lifetime.operation() as admitted:
+                        if admitted:
+                            self._handle(job)
             except Exception as exc:  # noqa: BLE001 — memory must never kill a session
                 log.warning("memory writer job %s failed: %s", job.get("t"), exc)
             finally:
+                job = None  # an idle worker must not retain the last frame/text payload
+                lifetime = None
                 self._q.task_done()
 
     def _handle(self, job: Dict[str, Any]) -> None:
@@ -237,7 +249,12 @@ class MemoryWriter:
             return
 
         media_hash = None
-        if self.media is not None:
+        if self.store.frames is not None:
+            # Record ownership BEFORE placing a frame: crash recovery can then
+            # remove a directory even if the following item insert never ran.
+            self.store.register_session(conv)
+            media_hash = self.store.frames.put(conv, jpeg)
+        elif self.media is not None:
             try:
                 media_hash = self.media.put_bytes(jpeg, orig_name="keyframe.jpg").get("hash")
             except Exception as exc:  # noqa: BLE001 — CAS rejection must not lose the vector
@@ -287,6 +304,19 @@ class MemoryWriter:
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError("memory writer drain timed out")
                 self._q.all_tasks_done.wait(remaining)
+
+    def discard_session(self, conversation_id: str, lifetime: Any) -> None:
+        """Remove queued payloads for a sealed session without draining others."""
+        with self._lifecycle_lock, self._q.mutex:
+            kept = [job for job in self._q.queue
+                    if not (job.get("conv") == conversation_id and job.get("lifetime") is lifetime)]
+            removed = len(self._q.queue) - len(kept)
+            self._q.queue.clear()
+            self._q.queue.extend(kept)
+            self._q.unfinished_tasks -= removed
+            if not self._q.unfinished_tasks:
+                self._q.all_tasks_done.notify_all()
+            self._q.not_full.notify_all()
 
     def forget(self, conversation_id: str) -> None:
         self._frames.pop(conversation_id, None)

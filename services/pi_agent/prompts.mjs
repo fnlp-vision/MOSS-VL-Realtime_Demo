@@ -4,22 +4,34 @@
 export const DECIDE_SYSTEM_PROMPT = `你是分类器。判断用户句子是否需要检索历史记忆；只需输出 JSON，格式固定——字段名英文不许翻译、不许改成其他结构：
 {"retrieve": true|false, "query": <检索词字符串或null>, "reason": "..."}
 
-下面整段是格式示例（照抄这个"句子/答"的格式，不要冒头说话）：
+retrieve 表示需要查找历史，不代表历史中一定有答案。近期对话不是完整历史；绝不能因为近期对话未出现目标就拒绝检索。
+query 用简短的实体和属性关键词表示检索目标，而不是复述问题。
+删除“我告诉你、你记得、之前、最早、刚才、是什么”等对话套话和相对时间词；时间范围由调用方处理。
+保留实体、型号、编号、否定或纠正等影响含义的信息。可根据近期对话解析指代，但不能猜测答案或补入未知的品牌、数字。
+例如“我之前给你看过的那台相机多少钱”对应 query="相机 价格"；“之前记下的验证码是多少”对应 query="验证码"。
+
+以下仅为输入输出示例。实际回复只输出 JSON，不输出“句子”或“答”。
 
 句子：今天天气怎么样
 答：{"retrieve":false,"query":null,"reason":"新话题，不涉及历史"}
 
 句子：我之前买的那台相机多少钱来着
-答：{"retrieve":true,"query":"我之前买的相机价格","reason":"涉及之前提过的事物"}
+答：{"retrieve":true,"query":"相机 价格","reason":"需要查找历史中的相机价格"}
+
+句子：最早我给你看的手机是什么型号
+答：{"retrieve":true,"query":"手机 型号","reason":"查找历史中的手机型号，近期没有也应检索"}
+
+句子：你记得之前的无线网络密码吗
+答：{"retrieve":true,"query":"无线网络 密码","reason":"需要搜索历史，不能预先判断有无答案"}
 
 句子：帮我看看这个清单
 答：{"retrieve":false,"query":null,"reason":"新请求，无历史指代"}
 
-现在开始，我说"句子"，你只回"答"。`;
+先判断当前问题是否引用历史，再提取实体属性关键词。不要判断近期对话是否已经包含答案。只输出 JSON。`;
 
 /** 构造 /decide 的 user prompt（few-shot 引导后的真实提问）。 */
 export function buildDecideUserPrompt({ recentTurns, pendingUserText }) {
-  return `\n近期对话（仅供理解指代，不是当前问题）：\n${recentTurns || "(空)"}\n句子："${pendingUserText}"\n答：`;
+  return `近期对话（不完整，仅辅助指代解析；未提到目标不代表历史不存在）：\n${recentTurns || "(空)"}\n\n当前问题：\n${pendingUserText}\n\n请为当前问题输出检索意图和简短的实体属性检索词。`;
 }
 
 /** Agent 模式 /decide 的 system prompt（带 memory_retrieve 工具的完整 agent loop）。 */

@@ -37,6 +37,7 @@ from ..logging_conf import get_logger
 from ..schemas import ChatMessage, ChatRequest, GenerationParams
 from . import inject as inject_mod
 from .pi_client import PiAgentClient
+from .lifecycle import SessionLifetime, while_open
 from .store import KIND_PINNED, KIND_UTTERANCE, MemoryItem, MemoryStore
 
 log = get_logger(__name__)
@@ -108,9 +109,10 @@ class RolloverManager:
                  *, plane: Any = None, base_system_prompt: str = "",
                  lang_getter: Optional[Callable[[], str]] = None,
                  semaphore: Optional[asyncio.Semaphore] = None,
-                 pi: Any = None,
+                 pi: Any = None, lifetime: Optional[SessionLifetime] = None,
                  journal_extra: Optional[Callable[[], Sequence[Tuple[str, str]]]] = None) -> None:
         self.settings = settings
+        self.lifetime = lifetime or SessionLifetime()
         self.store = store
         self.conversation_id = conversation_id
         # offline sglang plane (rt.vlm_offline) or None; the summarizer shares
@@ -172,6 +174,7 @@ class RolloverManager:
 
     # ------------------------------------------------------------------ prefix build
 
+    @while_open(([], [], 0))
     async def build_prefix(self) -> Tuple[List[dict], List[int], int]:
         """(prefill_messages, kept_item_ids, est_prefix_tokens).
 
@@ -409,6 +412,7 @@ class RolloverManager:
 
     # ------------------------------------------------------------------ compact prefetch
 
+    @while_open(False)
     def maybe_prefetch_compact(self, text_tokens: Any) -> bool:
         """Start a background _collect + pi /compact once text tokens cross
         `memory_rollover_idle_tokens * memory_rollover_prefetch_ratio` (default
@@ -438,6 +442,7 @@ class RolloverManager:
         thread.start()
         return True
 
+    @while_open()
     def _prefetch_worker(self, prefetch: _Prefetch) -> None:
         try:
             collected = self._collect()
@@ -453,6 +458,17 @@ class RolloverManager:
                 prefetch.status = status
                 prefetch.result = result
                 prefetch.done.set()
+
+    def seal(self) -> None:
+        self.lifetime.seal()
+        with self._prefetch_lock:
+            if self._prefetch is not None:
+                self._prefetch.done.set()
+            self._prefetch = None
+
+    def close(self) -> None:
+        self.seal()
+        self.lifetime.wait()
 
     def _take_prefetch(self) -> Optional[Tuple[Tuple[List[MemoryItem], List[MemoryItem], List[MemoryItem]],
                                                str, List[str]]]:

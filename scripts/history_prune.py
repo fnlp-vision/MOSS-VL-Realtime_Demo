@@ -4,13 +4,13 @@
 Both stores are archives — nothing auto-evicts. This tool is the only pruner:
 
   # delete media blobs no retained turn references (optionally: idle N+ days)
-  .venv/bin/python scripts/history_prune.py --unreferenced [--older-than 30]
+  .venv/bin/python scripts/history_prune.py --unreferenced --offline [--older-than 30]
 
   # drop whole conversations older than N days (index + journal; refs released)
-  .venv/bin/python scripts/history_prune.py --drop-conversations --older-than 90
+  .venv/bin/python scripts/history_prune.py --drop-conversations --older-than 90 --offline
 
   # reconstruct index.db from journals + a blob scan (proves the index is derived)
-  .venv/bin/python scripts/history_prune.py --rebuild
+  .venv/bin/python scripts/history_prune.py --rebuild --offline
 
 Run with the backend STOPPED (the index writer would race). DATA_DIR /
 HISTORY_DB_PATH env vars are honored (server/config.py). Add --dry-run to
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 import sqlite3
 import sys
 import time
@@ -27,15 +28,25 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server.config import get_settings  # noqa: E402
-from server.persistence.media import MediaStore  # noqa: E402
+from server.persistence.media import MediaStore, normalize_hash  # noqa: E402
+from server.memory.store import MemoryStore  # noqa: E402
 from server.persistence.recorder import HistoryRecorder, iter_journal_files, replay_file  # noqa: E402
 from server.persistence.store import IndexStore  # noqa: E402
 
 
 def prune_unreferenced(index: IndexStore, media: MediaStore,
                        older_than_days: float | None, dry_run: bool) -> int:
+    memory_path = Path(media.settings.memory_db_path or Path(media.settings.data_dir) / 'memory.db').resolve()
+    protected = set()
+    if memory_path.exists():
+        # Fail closed if memory references cannot be read. History ref_count
+        # alone never proved that a legacy memory keyframe was unreferenced.
+        with sqlite3.connect(memory_path.as_uri() + '?mode=ro', uri=True) as conn:
+            protected = {normalize_hash(r[0]) for r in conn.execute(
+                'SELECT DISTINCT media_hash FROM memory_items WHERE media_hash IS NOT NULL')}
     rows = index.unreferenced_media(
         older_than_s=older_than_days * 86400.0 if older_than_days else None)
+    rows = [row for row in rows if row['hash'] not in protected]
     for row in rows:
         h = row["hash"]
         print(f"{'DRY ' if dry_run else ''}prune media {h[:12]}… "
@@ -92,9 +103,29 @@ def main() -> int:
     ap.add_argument("--older-than", type=float, default=None, metavar="DAYS")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--vacuum", action="store_true")
+    ap.add_argument("--offline", action="store_true", help="confirm APIs are stopped before modifying archives")
     args = ap.parse_args()
+    if not (args.unreferenced or args.drop_conversations or args.rebuild):
+        ap.print_help()
+        return 2
 
     settings = get_settings()
+    if args.rebuild and args.dry_run:
+        ap.error('--rebuild does not support --dry-run')
+    if not args.dry_run and not args.offline:
+        ap.error('destructive maintenance requires --offline; stop all APIs first')
+    guard = None
+    try:
+        if not args.dry_run:
+            guard = MemoryStore(settings)
+            guard.open()
+        return run_prune(settings, args, ap)
+    finally:
+        if guard is not None:
+            guard.close()
+
+
+def run_prune(settings, args, ap):
     if args.rebuild:
         rebuild(settings)
         return 0
@@ -107,7 +138,6 @@ def main() -> int:
     index = IndexStore(settings)
     index.open()
     media = MediaStore(settings, index)
-    media.open()
     recorder = HistoryRecorder(settings, index)  # delete path is synchronous — no open()
     try:
         if args.drop_conversations:

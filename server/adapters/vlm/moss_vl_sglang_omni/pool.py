@@ -302,7 +302,9 @@ class SglangOmniPool:
             replica.state = BUSY if replica.used >= replica.slots else READY
 
     def _start_on_replica(self, replica: _Replica, params: Dict[str, Any]) -> SglangOmniSession:
-        payload = self._configure_payload(params)
+        capabilities = replica.health.get('video_realtime_capabilities')
+        payload = self._configure_payload(params, native_prefill=(
+            isinstance(capabilities, dict) and capabilities.get('prefill_messages') is True))
         client = SglangOmniClient(replica.url, self.s.sglang_omni_connect_timeout_s)
         try:
             created = client.open()
@@ -345,7 +347,7 @@ class SglangOmniPool:
 
     # ------------------------------------------------------------ configure mapping
 
-    def _configure_payload(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _configure_payload(self, params: Dict[str, Any], *, native_prefill: bool = False) -> Dict[str, Any]:
         """Map the router's start kwargs (routers/sessions.py:_vlm_start_params)
         onto session.configure. sglang-omni is extra=forbid: ONLY the keys the
         server declares may be sent."""
@@ -359,7 +361,13 @@ class SglangOmniPool:
         prompt = str(params.get("prompt") or "")
         system_prompt = params.get("system_prompt")
         prefill = _decode_prefill_messages(params.get("prefill_messages"))
-        if prefill:
+        native_messages = None
+        if prefill and native_prefill:
+            native_messages = _native_prefill(prefill, system_prompt)
+            if prompt:
+                native_messages[1:1] = [{'role': 'user', 'content': prompt},
+                                        {'role': 'assistant', 'content': '<|silence|>'}]
+        elif prefill:
             # rollover re-seat: the rebuilt memory prefix crosses as a JSON
             # string of chat messages; sglang-omni takes plain text, so system
             # messages fold into system_prompt and the rest renders as one
@@ -367,6 +375,12 @@ class SglangOmniPool:
             prefill_system, rendered = _render_prefill(prefill)
             if not system_prompt:
                 system_prompt = prefill_system
+            elif prefill_system and prefill_system != system_prompt:
+                # A caller-supplied base prompt must not discard the memory
+                # summary/pins that the compactor placed in its system block.
+                context = _compacted_context(prefill_system, system_prompt)
+                if context:
+                    rendered = f"<recall>\n{context}\n\n{rendered}\n</recall>"
             prompt = "\n\n".join(part for part in (prompt, rendered) if part)
 
         do_sample = bool(params.get("do_sample", True))
@@ -385,6 +399,7 @@ class SglangOmniPool:
             "temperature": temperature,
             "top_p": top_p,
             "input_queue_capacity": max(1, int(self.s.sglang_omni_input_queue_capacity)),
+            **({'prefill_messages': native_messages} if native_messages is not None else {}),
         }
 
     # ------------------------------------------------------------ health
@@ -394,7 +409,16 @@ class SglangOmniPool:
             resp = requests.get(f"{url}/health",
                                 timeout=max(1.0, self.s.sglang_omni_connect_timeout_s))
             if resp.ok:
-                return resp.json() if resp.content else {"ok": True}
+                health = resp.json() if resp.content else {"ok": True}
+                try:
+                    caps = requests.get(f'{url}/v1/video/realtime/capabilities', timeout=2)
+                    if caps.ok:
+                        value = caps.json()
+                        if isinstance(value, dict):
+                            health['video_realtime_capabilities'] = value
+                except Exception:
+                    pass  # legacy servers keep the original configure contract
+                return health
         except requests.RequestException:
             pass
         return None
@@ -429,6 +453,31 @@ class SglangOmniPool:
                     log.info("sglang-omni replica %d recovered (%s)", i, r.url)
                 # A newer rejection during the probe retains its own cooldown.
                 self._refresh_capacity(r)
+
+
+def _native_prefill(messages: List[Dict[str, str]], base_system: Optional[str]) -> list:
+    if not base_system:
+        return messages
+    system, _ = _render_prefill(messages)
+    context = _compacted_context(system or '', base_system)
+    result = [{'role': 'system', 'content': base_system}]
+    if context:
+        result.extend([{'role': 'user', 'content': f'<recall>\n{context}\n</recall>'},
+                       {'role': 'assistant', 'content': '<|silence|>'}])
+    result.extend(m for m in messages if m['role'] != 'system')
+    return result
+
+
+def _compacted_context(prefill_system: str, base_system: str) -> str:
+    """Keep all facts, without duplicating the known system/instruction prefix."""
+    from ....memory.inject import augment_system_prompt
+    for prefix in (augment_system_prompt(base_system, 'zh'),
+                   augment_system_prompt(base_system, 'en'), base_system):
+        if prefill_system == prefix:
+            return ''
+        if prefill_system.startswith(prefix + '\n'):
+            return prefill_system[len(prefix):].lstrip()
+    return prefill_system
 
 
 def _render_prefill(messages: List[Dict[str, str]]) -> tuple:

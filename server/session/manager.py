@@ -129,6 +129,7 @@ class SessionManager:
                         rollover = RolloverManager(
                             self.settings, self._memory_store, state.session_id,
                             plane=self._memory_plane,
+                            lifetime=memory.lifetime,
                             base_system_prompt=config.system_prompt or "",
                             lang_getter=lambda m=memory: m.language,
                             # interrupted turns ride the compact journal only
@@ -224,10 +225,12 @@ class SessionManager:
             state.phase = PHASE_CLOSED
             state.ws_token = None
         orchestrator: Optional[Any] = state.orchestrator
-        if orchestrator is not None:
-            await orchestrator.close()
-        if self._history is not None:
-            self._history.finalize(session_id, end_reason=reason)
+        try:
+            if orchestrator is not None:
+                await orchestrator.close()
+        finally:
+            if self._history is not None:
+                self._history.finalize(session_id, end_reason=reason)
         log.info("session %s closed (%s)", session_id, reason)
         return True
 

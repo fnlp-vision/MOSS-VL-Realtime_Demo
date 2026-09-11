@@ -9,6 +9,7 @@
 HTTP 服务（Node 22，纯 ESM `.mjs`，无 TS 构建链路），供 board Python 侧通过 HTTP 调用：
 
 - `POST /decide`：判定回答 pending 用户消息前是否需要长期记忆检索，并给出检索 query。
+- `POST /select`：从候选历史原文中选择可回答当前问题的证据 ID；没有证据返回空数组。
 - `POST /compact`：把带时间戳的会话 journal 压缩成 `summary` + `pins`。
 - `GET /health` 或 `/ready`：检查实际模型生成、模型身份和分词预算接口；未就绪返回 503。
 - `GET /live`：仅检查本进程存活。
@@ -21,10 +22,11 @@ HTTP 服务（Node 22，纯 ESM `.mjs`，无 TS 构建链路），供 board Pyth
 
 | 文件 | 职责 |
 |---|---|
-| `service.mjs` | HTTP 服务入口：env 引导（no_proxy、key 加载）、路由、错误统一为 502 |
+| `service.mjs` | HTTP 服务入口：环境配置、路由和分级错误响应 |
 | `decide.mjs` | `/decide` 实现：hop（单次结构化调用）/ agent（Agent + 工具 loop）双模式 |
+| `select.mjs` | 候选证据核验，仅返回输入候选中的 ID，不生成记忆内容 |
 | `compact.mjs` | `/compact` 实现 |
-| `prompts.mjs` | 全部 LLM prompt 模板 |
+| `prompts.mjs` | 检索规划和压缩的 LLM prompt 模板 |
 | `aigw.mjs` | AIGW 客户端封装：pi-ai `completeSimple`、key 读取、严格 JSON 解析与一次重试 |
 
 ## 依赖
@@ -51,19 +53,15 @@ Node 内置 `http`/`fs`/`fetch`，不新增 npm 依赖。
 | `PI_CONTEXT_TOKENS` | `16384` | 应用上下文上限，与后端实际上限取较小值，不改变 GPU 预分配 |
 | `PI_COMPACT_CHUNK_TOKENS` | `4096` | 单段最终 system + user 输入预算，按完整 QA 分段 |
 
-**部署必须保证 `no_proxy` 覆盖 `aigw.sotatts.online`**，否则进程经 HTTP(S) 代理出站会
-TLS 失败。服务启动时会自动把该 host 追加进 `process.env.no_proxy`/`NO_PROXY` 兜底，
-但仍建议在部署环境的 shell/systemd unit 里显式配置：
-
-```bash
-export no_proxy="${no_proxy:+$no_proxy,}aigw.sotatts.online"
-export NO_PROXY="$no_proxy"
-```
+本地模式仅访问所配置的 loopback 后端，不要求任何内部域名或内部凭据。
 
 ## 启动
 
+以下为独立运行示例，从 Demo 仓库根目录执行，并先准备好 `38090` 端口的 4B 后端。推荐 `run.py up` 已自动启动 pi-agent，无需重复执行本节；托管端口由该启动器统一分配。
+
 ```bash
-cd pi_agent
+cd services/pi_agent
+export PATH="$(pwd)/../../.repro/node/bin:$PATH"
 export AIGW_DECIDE_BASE_URL=http://127.0.0.1:38090/v1
 export AIGW_COMPACT_BASE_URL=http://127.0.0.1:38090/v1
 export AIGW_DECIDE_MODEL=Qwen3-4B-Instruct-2507
@@ -77,10 +75,19 @@ PI_AGENT_MODE=agent npm start          # agent 模式（需要 board memory 在�
 
 ## 契约示例
 
+Demo 的 `hybrid` 模式对明确的历史指代先调用 `/decide`，使用返回的实体属性检索词搜索，
+所有通过本地准入的 hybrid 候选均调用 `/select`，结合近期纠正核验证据，最后再进行上下文去重。
+不能先过滤已在上下文的新值，再让旧值递补。其他问题仍保留前置向量预筛。
+`/decide` 和 `/select` 共用 Demo 的 `MEMORY_PI_DECIDE_TIMEOUT_S` 时间预算（默认 8 秒，包含中间检索耗时）。
+`/select` 请求为 `{"query":"问题原文","recent_turns":"近期对话（可选）","candidates":[{"id":1,"role":"assistant","session_ts":75,"text":"历史原文"}]}`，
+响应为 `{"ids":[1]}` 或 `{"ids":[]}`。最多 16 条候选，每条原文最多 2000 字符；输出 ID 必须来自输入。
+核验失败或旧 sidecar 不支持该接口时，新增路径退回原有保守分数门槛，不直接放行候选。
+升级时需同步更新 Demo API 和 pi-agent；无需重新下载权重或新增模型进程。
+
 ```bash
 # 健康检查
 curl -s http://127.0.0.1:38080/health
-# {"ok":true,"model":"kimi-k3","compact_model":"kimi-k3","mode":"hop"}
+# {"ok":true,"model":"Qwen3-4B-Instruct-2507","compact_model":"Qwen3-4B-Instruct-2507","mode":"hop"}
 
 # 决策
 curl -s http://127.0.0.1:38080/decide -H 'content-type: application/json' -d '{
@@ -121,14 +128,14 @@ SDK 内部自动重试关闭，避免与 Demo 重试叠加。`/ready` 同时返�
 
 - **hop**（默认，`PI_AGENT_MODE=hop`）：单次结构化 LLM 调用。系统 prompt 要求严格 JSON
   `{retrieve, query, reason}`；解析失败自动加一条"上次不是合法 JSON"的 nudge 重试一次，
-  仍失败则 502。实测延迟 ~1.5–2.2s。
+  仍失败则 502。
 - **agent**（`PI_AGENT_MODE=agent`）：用 pi-agent-core 的 `Agent` 跑完整 agent loop，
   注册 `memory_retrieve` 工具（0.74.2 没有独立 `registerTool` API，通过
   `agent.state.tools` 注册）。工具的 `execute` 回调 HTTP 调用 board 的
   `POST {BOARD_MEMORY_URL}/api/memory/retrieve`，body
   `{"conversation_id","query","top_k":4}`，结果作为 tool result 回到模型，再由模型输出
   最终 JSON 结论。board memory 不在线时工具调用报错，agent 会带着错误信息继续给出结论
-  （倾向 retrieve=true），不会整体 502。实测一轮工具调用延迟 ~12s，故有独立
+  （倾向 retrieve=true），不会整体 502。该模式使用独立
   `PI_AGENT_TIMEOUT_MS`（默认 45s）。
 
 ## 已知限制
@@ -138,5 +145,3 @@ SDK 内部自动重试关闭，避免与 Demo 重试叠加。`/ready` 同时返�
 - hop 模式的严格 JSON 依赖模型遵循指令；解析失败只有一次重试机会。
 - agent 模式端到端验证使用了 board memory 的本地 stub（真实 board 联调待其 8081 服务
   上线后进行）。
-- AIGW 上 `kimi-k3` 的 thinking 内容（pi-ai 中的 thinking block）原样透传展示，不影响
-  最终 text 输出解析。

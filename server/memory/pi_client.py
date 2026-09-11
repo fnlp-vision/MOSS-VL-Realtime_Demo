@@ -97,6 +97,20 @@ class PiAgentClient:
         self._url = (settings.memory_pi_url or "").rstrip("/")
         self._reachability: tuple = (0.0, False)
 
+    def select(self, query: str, candidates: list, *, timeout_s: float, recent_turns: str = '') -> Optional[list]:
+        """Evidence IDs only; None means unavailable, not a positive verdict."""
+        if not self._url or timeout_s <= 0:
+            return None
+        result = _post_json(f"{self._url}/select", {"query": query, "candidates": candidates,
+                                                   "recent_turns": recent_turns}, timeout_s)
+        if result is None:
+            return None
+        ids = result.get("ids")
+        allowed = {c["id"] for c in candidates}
+        if not isinstance(ids, list) or any(type(i) is not int or i not in allowed for i in ids):
+            return None
+        return list(dict.fromkeys(ids))
+
     def decide(
         self,
         conversation_id: str,

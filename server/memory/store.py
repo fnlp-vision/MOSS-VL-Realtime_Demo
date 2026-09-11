@@ -24,10 +24,13 @@ open short-lived WAL connections. Nothing here may be called on the event loop
 from __future__ import annotations
 
 import os
+import fcntl
+import shutil
 import sqlite3
 import struct
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -101,6 +104,15 @@ CREATE TABLE IF NOT EXISTS memory_item_keys (
   item_id INTEGER PRIMARY KEY,
   key     TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS memory_sessions (
+  conversation_id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT
+);
 """
 
 
@@ -155,13 +167,19 @@ class MemoryStore:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         path = (settings.memory_db_path or "").strip()
-        self.path = path or os.path.join(settings.data_dir, "memory.db")
+        self.path = os.path.realpath(path or os.path.join(settings.data_dir, "memory.db"))
         self._lock = threading.RLock()
         self._conn: Optional[sqlite3.Connection] = None
         self._idx: Dict[Tuple[str, str], _VecIndex] = {}
         # late-interaction matrices: conv -> {item_id: (T, dim) float32}
         self._li: Dict[str, Dict[int, np.ndarray]] = {}
         self._li_loaded: Set[str] = set()
+        self.owner_id = uuid.uuid4().hex
+        self._file_lock = None
+        self._cleanup_lock = threading.Lock()
+        self.frames = None
+        self.accepting_writes = True
+        self._storage_status = {}
 
     # ---- lifecycle ----
 
@@ -170,24 +188,47 @@ class MemoryStore:
             if self._conn is not None:
                 return
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-            conn = sqlite3.connect(self.path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.executescript(_SCHEMA)
-            conn.commit()
+            lock = open(self.path + '.lock', 'a+b')
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                lock.close()
+                raise RuntimeError('memory database is owned by another API or maintenance process')
+            self._file_lock = lock
+            conn = None
+            try:
+                conn = sqlite3.connect(self.path, check_same_thread=False)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.executescript(_SCHEMA)
+                conn.commit()
+            except Exception:
+                if conn is not None:
+                    conn.close()
+                lock.close()
+                self._file_lock = None
+                raise
             self._conn = conn
             log.info("memory store open: %s", self.path)
 
     def close(self) -> None:
         with self._lock:
-            if self._conn is not None:
+            conn, self._conn = self._conn, None
+            try:
+                if conn is not None:
+                    conn.commit()
+            finally:
                 try:
-                    self._conn.commit()
-                    self._conn.close()
+                    if conn is not None:
+                        conn.close()
                 finally:
-                    self._conn = None
-            self._idx.clear()
+                    self._idx.clear()
+                    self._li.clear()
+                    self._li_loaded.clear()
+                    if self._file_lock is not None:
+                        self._file_lock.close()
+                        self._file_lock = None
 
     def _require(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -205,6 +246,7 @@ class MemoryStore:
         now = time.time()
         with self._lock:
             conn = self._require()
+            self._register_session(conn, conversation_id)
             cur = conn.execute(
                 "INSERT INTO memory_items (conversation_id, kind, role, text, lang, session_ts,"
                 " media_ts, media_hash, importance, valid_from, created_at, source_ids)"
@@ -218,6 +260,8 @@ class MemoryStore:
         arr = np.asarray(vec, dtype=np.float32).ravel()
         with self._lock:
             conn = self._require()
+            if not self._owns_item(conn, conversation_id, item_id):
+                return
             conn.execute(
                 "INSERT OR REPLACE INTO memory_vectors (item_id, space, dim, vec) VALUES (?,?,?,?)",
                 (item_id, space, int(arr.size), arr.tobytes()))
@@ -234,6 +278,8 @@ class MemoryStore:
         blob = _pack_li(arr)
         with self._lock:
             conn = self._require()
+            if not self._owns_item(conn, conversation_id, item_id):
+                return
             conn.execute(
                 "INSERT OR REPLACE INTO memory_vectors (item_id, space, dim, vec) VALUES (?,?,?,?)",
                 (item_id, SPACE_TEXT_LI, int(arr.shape[-1]), blob))
@@ -252,6 +298,8 @@ class MemoryStore:
         arr = np.asarray(vec, dtype=np.float32)
         with self._lock:
             conn = self._require()
+            if not self._owns_item(conn, conversation_id, item_id):
+                return
             if space == SPACE_TEXT_LI:
                 if arr.ndim == 1:
                     arr = arr.reshape(1, -1)
@@ -276,10 +324,13 @@ class MemoryStore:
                 else:
                     idx.append(item_id, arr)
 
-    def put_key(self, item_id: int, key: str) -> None:
+    def put_key(self, item_id: int, key: str, *, conversation_id: Optional[str] = None) -> None:
         """Persist the retrieval index key for audit (never shown to the model)."""
         with self._lock:
             conn = self._require()
+            row = conn.execute("SELECT conversation_id FROM memory_items WHERE id = ?", (item_id,)).fetchone()
+            if row is None or (conversation_id is not None and row["conversation_id"] != conversation_id):
+                return
             conn.execute("INSERT OR REPLACE INTO memory_item_keys (item_id, key) VALUES (?,?)",
                          (int(item_id), key))
             conn.commit()
@@ -295,7 +346,7 @@ class MemoryStore:
             conn = self._require()
             conn.execute(
                 "UPDATE memory_items SET injected_in = COALESCE(injected_in || ',', '') || ?"
-                " WHERE id = ?", (session_id, item_id))
+                " WHERE id = ? AND conversation_id = ?", (session_id, item_id, session_id))
             conn.commit()
 
     def invalidate(self, item_id: int) -> None:
@@ -426,3 +477,88 @@ class MemoryStore:
                 self._idx.pop((conversation_id, space), None)
             self._li.pop(conversation_id, None)
             self._li_loaded.discard(conversation_id)
+
+    @staticmethod
+    def _owns_item(conn: sqlite3.Connection, conversation_id: str, item_id: int) -> bool:
+        return conn.execute("SELECT 1 FROM memory_items WHERE id = ? AND conversation_id = ?",
+                            (item_id, conversation_id)).fetchone() is not None
+
+    def delete_session(self, conversation_id: str) -> int:
+        """Delete runtime memory atomically; history and shared media are separate."""
+        with self._cleanup_lock:
+            with self._lock:
+                conn = self._require()
+                self._register_session(conn, conversation_id)
+                conn.execute("UPDATE memory_sessions SET state='pending' WHERE conversation_id=?", (conversation_id,))
+                conn.commit()
+            try:
+                with self._lock:
+                    with conn:
+                        for table in ("memory_vectors", "memory_item_keys"):
+                            conn.execute(f"DELETE FROM {table} WHERE item_id IN "
+                                         "(SELECT id FROM memory_items WHERE conversation_id = ?)", (conversation_id,))
+                        count = conn.execute("DELETE FROM memory_items WHERE conversation_id = ?", (conversation_id,)).rowcount
+                    self.forget_session_cache(conversation_id)
+                if self.frames is not None:
+                    self.frames.delete_session(conversation_id)
+                with self._lock:
+                    conn.execute("DELETE FROM memory_sessions WHERE conversation_id=?", (conversation_id,))
+                    conn.commit()
+                return count
+            except Exception as exc:
+                with self._lock:
+                    conn.execute("UPDATE memory_sessions SET attempts=attempts+1,last_error=? WHERE conversation_id=?",
+                                 (str(exc)[:500], conversation_id))
+                    conn.commit()
+                raise
+
+    def _register_session(self, conn, conversation_id):
+        conn.execute("INSERT OR IGNORE INTO memory_sessions(conversation_id,owner_id,state,created_at) VALUES(?,?,'active',?)",
+                     (conversation_id, self.owner_id, time.time()))
+
+    def register_session(self, conversation_id):
+        with self._lock:
+            conn = self._require()
+            self._register_session(conn, conversation_id)
+            conn.commit()
+
+    def cleanup_candidates(self, *, recover=False, include_legacy=False):
+        with self._lock:
+            conn = self._require()
+            rows = conn.execute("SELECT conversation_id FROM memory_sessions WHERE state='pending'" +
+                                (" OR owner_id != ?" if recover else ""), (self.owner_id,) if recover else ()).fetchall()
+            ids = {r[0] for r in rows}
+            if include_legacy:
+                ids.update(r[0] for r in conn.execute("SELECT DISTINCT conversation_id FROM memory_items "
+                           "WHERE conversation_id NOT IN (SELECT conversation_id FROM memory_sessions)"))
+            return sorted(ids)
+
+    def refresh_storage_status(self):
+        with self._lock:
+            self._require()
+        # A shared filesystem stat can stall. Never hold the retrieval DB lock
+        # while waiting for filesystem capacity metadata.
+        free_bytes = shutil.disk_usage(os.path.dirname(os.path.abspath(self.path))).free
+        with self._lock:
+            conn = self._require()
+            page_size = conn.execute('PRAGMA page_size').fetchone()[0]
+            pages = conn.execute('PRAGMA page_count').fetchone()[0]
+            free_pages = conn.execute('PRAGMA freelist_count').fetchone()[0]
+            used = (pages - free_pages) * page_size
+            reason = 'low_disk' if free_bytes < self.settings.memory_min_free_bytes else (
+                'memory_budget' if self.settings.memory_max_db_bytes > 0 and used >= self.settings.memory_max_db_bytes else '')
+            if bool(reason) == self.accepting_writes:
+                log.warning('memory storage admission: %s (occupied=%d, disk_free=%d)', reason or 'resumed', used, free_bytes)
+            self.accepting_writes = not reason
+            self._storage_status = {'occupied_bytes': used, 'reusable_bytes': free_pages * page_size,
+                                    'disk_free_bytes': free_bytes, 'paused_reason': reason}
+            return dict(self._storage_status)
+
+    def reclaim_space(self, *, vacuum=False):
+        """Checkpoint online; full VACUUM is reserved for exclusive offline maintenance."""
+        with self._lock:
+            conn = self._require()
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)' if vacuum else 'PRAGMA wal_checkpoint(PASSIVE)')
+            if vacuum:
+                conn.execute('VACUUM')
+                conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
