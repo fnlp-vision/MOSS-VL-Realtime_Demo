@@ -20,7 +20,7 @@ from server.memory.session import RecallResult
 
 
 @pytest.mark.parametrize('frames_forwarded', [0, 1])
-def test_verified_missing_evidence_is_a_notice_with_or_without_video(tmp_path, frames_forwarded):
+def test_candidate_miss_does_not_block_native_context_with_or_without_video(tmp_path, frames_forwarded):
     async def run():
         settings, store, writer, memory = _make_session(str(tmp_path), MEMORY_DECISION_MODE='vector')
         memory.note_context_turn('user', '鼠标是ATK')
@@ -33,11 +33,10 @@ def test_verified_missing_evidence_is_a_notice_with_or_without_video(tmp_path, f
         try:
             await orch._user_turn('我之前说的银行卡密码是什么')
             events = [json.loads(item.text) for item in state.replay]
-            assert any(e['type'] == p.MEMORY_NOTICE and e['code'] == 'no_evidence' for e in events)
-            assert any(e['type'] == p.RESPONSE_DONE and e['source'] == 'system' for e in events)
-            assert not engine.prompts and not engine.prompt_frames
-            assert orch._pending_source_notes == ['source changed']
-            assert orch._pending_fact_user_text is None
+            assert not any(e['type'] == p.MEMORY_NOTICE for e in events)
+            assert engine.prompts and 'source changed' in engine.prompts[0]
+            assert orch._pending_source_notes == []
+            assert orch._pending_fact_user_text == '我之前说的银行卡密码是什么'
         finally:
             await orch.close()
             writer.stop()

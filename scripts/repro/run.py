@@ -1,6 +1,7 @@
 """Portable single-host deployment for the installed release profiles."""
 import argparse
 import csv
+import errno
 import fcntl
 import json
 import os
@@ -10,6 +11,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from urllib.request import ProxyHandler, build_opener
 
 import psutil
@@ -46,27 +48,109 @@ def clean_environment():
     return env
 
 
-def stop(records):
+def live_processes(processes):
+    alive = []
+    for process in processes:
+        try:
+            if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+                alive.append(process)
+        except psutil.NoSuchProcess:
+            pass
+    return alive
+
+
+def wait_ports_released(ports, timeout=10):
+    pending = set(ports)
+    deadline = time.monotonic() + timeout
+    if pending:
+        print(f"Waiting for ports to be released: {sorted(pending)}", flush=True)
+    while pending:
+        for port in list(pending):
+            try:
+                with socket.socket() as listener:
+                    # Match the server's address reuse behavior; TIME_WAIT is
+                    # not a still-running listener.
+                    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    listener.bind(("127.0.0.1", port))
+            except OSError as exc:
+                if exc.errno != errno.EADDRINUSE:
+                    raise
+            else:
+                pending.remove(port)
+        if not pending:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Ports still occupied: {sorted(pending)}; state retained, startup not permitted")
+        time.sleep(min(.1, max(0, deadline - time.monotonic())))
+
+
+def wait_stopped(processes, timeout):
+    deadline = time.monotonic() + timeout
+    alive = live_processes(processes)
+    while alive and time.monotonic() < deadline:
+        _, alive = psutil.wait_procs(alive, timeout=min(.2, max(0, deadline - time.monotonic())))
+        alive = live_processes(alive)
+    return alive
+
+
+def stop(records, ports=(), timeout=30):
+    print("Stopping old services; waiting for their processes to exit...", flush=True)
     targets = {}
     for entry in records:
+        token = entry.get("owner_token")
         try:
             p = psutil.Process(entry["pid"])
-            if abs(p.create_time() - entry["created"]) > .01 or p.environ().get("MOSS_REPRO_ROOT") != str(ROOT):
-                raise RuntimeError(f"Process ownership mismatch for pid {p.pid}; not stopped")
-            targets[p.pid] = p
-            targets.update({child.pid: child for child in p.children(recursive=True)})
+            if p.status() == psutil.STATUS_ZOMBIE:
+                print(f"Process {p.pid} is already stopped (zombie); skipping environment check", flush=True)
+            else:
+                if abs(p.create_time() - entry["created"]) > .01 or p.environ().get("MOSS_REPRO_ROOT") != str(ROOT):
+                    raise RuntimeError(f"Process ownership mismatch for pid {p.pid}; not stopped")
+                targets[p.pid] = p
+                targets.update({child.pid: child for child in p.children(recursive=True)})
         except psutil.NoSuchProcess:
-            continue
-    for process in targets.values():
+            if not token:
+                raise RuntimeError("Legacy deployment parent is gone; cannot verify orphan ownership. State retained for manual cleanup")
+        if token:
+            # Children retain this per-component token even after reparenting.
+            for process in psutil.process_iter():
+                try:
+                    if process.status() == psutil.STATUS_ZOMBIE:
+                        continue
+                    env = process.environ()
+                    if env.get("MOSS_REPRO_ROOT") == str(ROOT) and env.get("MOSS_REPRO_PROCESS_ID") == token:
+                        targets[process.pid] = process
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+    targets = live_processes(targets.values())
+    for process in targets:
         try: process.terminate()
         except psutil.NoSuchProcess: pass
-    _, alive = psutil.wait_procs(list(targets.values()), timeout=10)
+    alive = wait_stopped(targets, timeout)
+    if alive:
+        print(f"Graceful stop timed out; killing owned processes: {[p.pid for p in alive]}", flush=True)
     for process in alive:
         try: process.kill()
         except psutil.NoSuchProcess: pass
-    _, alive = psutil.wait_procs(alive, timeout=3)
-    if any(p.status() != psutil.STATUS_ZOMBIE for p in alive):
+    if wait_stopped(alive, 3):
         raise RuntimeError("Some owned processes have not exited; state retained")
+    wait_ports_released(ports)
+    print("Old processes stopped and deployment ports released.", flush=True)
+
+
+def acquire_run_lock(lock, timeout=60):
+    deadline = time.monotonic() + timeout
+    announced = False
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if not announced:
+                print("Waiting for the previous startup/shutdown operation to finish...", flush=True)
+                announced = True
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Previous startup/shutdown is still running; no new operation started")
+            time.sleep(min(.1, max(0, deadline - time.monotonic())))
 
 
 def wait_for(url, process, ready, timeout=1200):
@@ -108,6 +192,7 @@ def up(args):
         raise ValueError("base-port must be between 1024 and 65530")
     for port in ports.values():
         with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind(("127.0.0.1", port))  # never steal someone else's port
     env = clean_environment()
     cuda_home = subprocess.check_output([str(HOME / ".venv-main/bin/python"),
@@ -145,11 +230,14 @@ def up(args):
 
     def start(name, command, cwd=ROOT, overrides=None):
         child_env = dict(env, **(overrides or {}))
+        owner_token = uuid.uuid4().hex
+        child_env["MOSS_REPRO_PROCESS_ID"] = owner_token
         child_env["PATH"] = f"{Path(command[0]).parent}:{child_env['PATH']}"
         with (HOME / f"logs/{name}.log").open("a") as log:
             process = subprocess.Popen(list(map(str, command)), cwd=cwd, env=child_env,
                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-        records.append({"name": name, "pid": process.pid, "created": psutil.Process(process.pid).create_time()})
+        records.append({"name": name, "pid": process.pid, "created": psutil.Process(process.pid).create_time(),
+                        "owner_token": owner_token})
         STATE.write_text(json.dumps(state, indent=2))
         print(f"Starting {name} (pid {process.pid})", flush=True)
         return process
@@ -197,7 +285,7 @@ def up(args):
         if 'tts' in profiles:
             print(f"TTS: http://127.0.0.1:{ports['tts']}", flush=True)
     except BaseException:
-        stop(records)
+        stop(records, ports.values())
         STATE.unlink(missing_ok=True)
         raise
 
@@ -217,12 +305,16 @@ def main():
         raise ValueError("cpu-threads must be positive")
     HOME.mkdir(exist_ok=True)
     lock = (HOME / "run.lock").open("a")
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    acquire_run_lock(lock)
     if args.command == "up": up(args)
     elif args.command == "down":
         if STATE.exists():
-            stop(json.loads(STATE.read_text())["processes"])
+            state = json.loads(STATE.read_text())
+            stop(state["processes"], state.get("ports", {}).values())
             STATE.unlink()
+            print("Stopped; deployment state cleared. A new startup may now begin.", flush=True)
+        else:
+            print("Not running; no deployment state to clear.", flush=True)
     elif STATE.exists():
         state = json.loads(STATE.read_text())
         print(json.dumps({"state": state, "gateway": get(f"http://127.0.0.1:{state['ports']['api']}/api/status")}, ensure_ascii=False))

@@ -19,6 +19,8 @@ preview, --vacuum to compact the DB afterwards.
 from __future__ import annotations
 
 import argparse
+import math
+from contextlib import closing
 import os
 from pathlib import Path
 import sqlite3
@@ -32,6 +34,7 @@ from server.persistence.media import MediaStore, normalize_hash  # noqa: E402
 from server.memory.store import MemoryStore  # noqa: E402
 from server.persistence.recorder import HistoryRecorder, iter_journal_files, replay_file  # noqa: E402
 from server.persistence.store import IndexStore  # noqa: E402
+from server.persistence.retention import acquire_archive_lock
 
 
 def prune_unreferenced(index: IndexStore, media: MediaStore,
@@ -47,6 +50,10 @@ def prune_unreferenced(index: IndexStore, media: MediaStore,
     rows = index.unreferenced_media(
         older_than_s=older_than_days * 86400.0 if older_than_days else None)
     rows = [row for row in rows if row['hash'] not in protected]
+    with closing(sqlite3.connect(Path(index.db_path).resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+        # Recheck actual references, not only the denormalized ref_count column.
+        rows = [row for row in rows if not conn.execute(
+            'SELECT 1 FROM turn_media WHERE hash=? LIMIT 1', (row['hash'],)).fetchone()]
     for row in rows:
         h = row["hash"]
         print(f"{'DRY ' if dry_run else ''}prune media {h[:12]}… "
@@ -59,9 +66,11 @@ def prune_unreferenced(index: IndexStore, media: MediaStore,
 
 def drop_conversations(index: IndexStore, recorder: HistoryRecorder,
                        older_than_days: float, dry_run: bool) -> int:
+    if not math.isfinite(older_than_days) or older_than_days <= 0:
+        raise ValueError('Retention days must be finite and positive')
     cutoff = time.time() - older_than_days * 86400.0
     victims = [c for c in index.list_conversations(limit=100000)
-               if (c["ended_at"] or c["created_at"]) < cutoff]
+               if c['ended_at'] is not None and c['ended_at'] < cutoff]
     for c in victims:
         print(f"{'DRY ' if dry_run else ''}drop conversation {c['conversation_id']} "
               f"({c['kind']}, {c['turn_count']} turns, {c['title']!r})")
@@ -105,6 +114,8 @@ def main() -> int:
     ap.add_argument("--vacuum", action="store_true")
     ap.add_argument("--offline", action="store_true", help="confirm APIs are stopped before modifying archives")
     args = ap.parse_args()
+    if args.older_than is not None and (not math.isfinite(args.older_than) or args.older_than <= 0):
+        ap.error('--older-than must be finite and positive')
     if not (args.unreferenced or args.drop_conversations or args.rebuild):
         ap.print_help()
         return 2
@@ -115,14 +126,18 @@ def main() -> int:
     if not args.dry_run and not args.offline:
         ap.error('destructive maintenance requires --offline; stop all APIs first')
     guard = None
+    archive_guard = None
     try:
         if not args.dry_run:
+            archive_guard = acquire_archive_lock(settings.history_db_path or os.path.join(settings.data_dir,'index.db'), exclusive=True)
             guard = MemoryStore(settings)
             guard.open()
         return run_prune(settings, args, ap)
     finally:
         if guard is not None:
             guard.close()
+        if archive_guard is not None:
+            archive_guard.close()
 
 
 def run_prune(settings, args, ap):

@@ -15,6 +15,9 @@ separate wakeup event keeps the stop notification independent of queue capacity.
 from __future__ import annotations
 
 import math
+import hashlib
+from collections import OrderedDict
+from contextlib import nullcontext
 import queue
 import threading
 import time
@@ -26,7 +29,7 @@ import numpy as np
 from ..config import Settings
 from ..logging_conf import get_logger
 from . import embed as embed_mod
-from .store import KIND_FRAME, KIND_UTTERANCE, SPACE_IMAGE, SPACE_TEXT, MemoryStore
+from .store import KIND_FRAME, KIND_UTTERANCE, SPACE_IMAGE, SPACE_TEXT, MemoryStore, MemoryBudgetExceeded
 
 log = get_logger(__name__)
 
@@ -59,18 +62,41 @@ class MemoryWriter:
         self._seen_utterances: Dict[str, set] = {}
         self._seen_lock = threading.Lock()
         self._stopping = False
+        self._payload_bytes = 0
+        self._session_payload_bytes = {}
         self.stats = {"utterances": 0, "frames_kept": 0, "frames_skipped": 0,
                       "dropped": 0, "utterances_rejected": 0}
 
-    def _mark_utterance_seen(self, conversation_id: str, role: str, text: str) -> bool:
+    def _mark_utterance_seen(self, conversation_id: str, role: str, text: str, historical_answer=False) -> bool:
         """True on first sight, False on an exact duplicate (whitespace-normalized)."""
-        marker = (str(role), " ".join(str(text).split()))
+        marker = self._utterance_key(role, text, historical_answer)
         with self._seen_lock:
-            seen = self._seen_utterances.setdefault(str(conversation_id), set())
+            seen = self._seen_utterances.setdefault(str(conversation_id), OrderedDict())
             if marker in seen:
                 return False
-            seen.add(marker)
+            seen[marker] = None
+            while len(seen) > max(1, self.settings.memory_session_max_items):
+                seen.popitem(last=False)
             return True
+
+    @staticmethod
+    def _utterance_key(role, text, historical_answer=False):
+        return hashlib.sha256((str(role)+'\0'+str(historical_answer)+'\0'+' '.join(str(text).split())).encode()).digest()
+
+    def _release_payload(self, job):
+        size = job.get('_payload_bytes', 0)
+        conv = job.get('conv')
+        self._payload_bytes -= size
+        left = self._session_payload_bytes.get(conv, 0) - size
+        if left > 0:
+            self._session_payload_bytes[conv] = left
+        else:
+            self._session_payload_bytes.pop(conv, None)
+
+    def status(self):
+        with self._lifecycle_lock:
+            return {**self.stats, 'payload_bytes': self._payload_bytes,
+                    'queued_items': self._q.qsize(), 'pending_sessions': len(self._session_payload_bytes)}
 
     # ---- lifecycle ----
 
@@ -123,6 +149,14 @@ class MemoryWriter:
             lifetime = job.get("lifetime")
             if self._stopping or not self.store.accepting_writes or (lifetime is not None and lifetime.closing):
                 return False
+            size = len(job.get('jpeg', b'')) + len(job.get('text', '').encode('utf-8'))
+            conv = job.get('conv')
+            if (self._payload_bytes + size > max(1, self.settings.memory_queue_max_bytes) or
+                    self._session_payload_bytes.get(conv, 0) + size > max(1, self.settings.memory_queue_session_bytes)):
+                self.stats['dropped'] += 1
+                self.stats['budget_rejected'] = self.stats.get('budget_rejected', 0) + 1
+                return False
+            job['_payload_bytes'] = size
             try:
                 self._q.put_nowait(job)
             except queue.Full:
@@ -139,37 +173,48 @@ class MemoryWriter:
                         log.error("memory queue full: utterance NOT accepted for %s; "
                                   "accepted utterances retained", job.get("conv"))
                         return False
+                    self._release_payload(self._q.queue[victim])
                     del self._q.queue[victim]
                     self._q.queue.append(job)
                     self.stats["dropped"] += 1
+            self._payload_bytes += size
+            self._session_payload_bytes[conv] = self._session_payload_bytes.get(conv, 0) + size
             self._wakeup.set()
             return True
 
     def note_utterance(self, conversation_id: str, role: str, text: str, *, lang: str,
                        session_ts: Optional[float] = None, media_ts: Optional[float] = None,
-                       importance: float = 0.5, lifetime: Any = None) -> bool:
+                       importance: float = 0.5, lifetime: Any = None, historical_answer: bool = False) -> bool:
         text = (text or "").strip()
         if not text:
+            return False
+        if len(text) > max(1, self.settings.memory_item_max_chars):
+            self.stats['utterances_rejected'] += 1
             return False
         with self._lifecycle_lock:
             if self._stopping or (lifetime is not None and lifetime.closing):
                 return False
-            if not self._mark_utterance_seen(conversation_id, role, text):
-                log.debug("dropped duplicate %s utterance for %s: %r",
+            if not self._mark_utterance_seen(conversation_id, role, text, historical_answer):
+                log.debug("updating repeat timestamp for %s utterance in %s: %r",
                           role, conversation_id, text[:60])
-                return True
+                return self._put({'t':'repeat', 'conv':conversation_id, 'role':role, 'text':text,
+                                  'lang':lang, 'session_ts':session_ts, 'media_ts':media_ts,
+                                  'importance':importance, 'lifetime':lifetime,
+                                  'historical_answer':historical_answer}, droppable=False)
             accepted = self._put({"t": "utterance", "conv": conversation_id, "role": role, "text": text,
                        "lang": lang, "session_ts": session_ts, "media_ts": media_ts,
-                       "importance": importance, "lifetime": lifetime}, droppable=False)
+                       "importance": importance, "lifetime": lifetime, "historical_answer": historical_answer}, droppable=False)
             if not accepted:
                 with self._seen_lock:
-                    self._seen_utterances[str(conversation_id)].discard(
-                        (str(role), " ".join(text.split())))
+                    self._seen_utterances.get(str(conversation_id), {}).pop(self._utterance_key(role, text, historical_answer), None)
             return accepted
 
     def note_frame(self, conversation_id: str, jpeg: bytes, *, session_ts: Optional[float] = None,
                    media_ts: Optional[float] = None, lang: str = "zh", lifetime: Any = None) -> None:
         if not jpeg:
+            return
+        if len(jpeg) > max(1, self.settings.memory_frame_max_bytes):
+            self.stats['dropped'] += 1
             return
         self._put({"t": "frame", "conv": conversation_id, "jpeg": jpeg, "lang": lang,
                    "session_ts": session_ts, "media_ts": media_ts, "lifetime": lifetime}, droppable=True)
@@ -187,28 +232,47 @@ class MemoryWriter:
                         return
                     self._wakeup.clear()
                     continue
+                lifetime = job.get('lifetime')
+                lease = lifetime.operation() if lifetime is not None else nullcontext(True)
+                admitted = lease.__enter__()
+                if not admitted:
+                    self._release_payload(job)
+                    job = None
+                    self._q.task_done()
+                    lease.__exit__(None, None, None)
+                    continue
             try:
-                lifetime = job.get("lifetime")
                 if not self.store.accepting_writes:
                     self.stats['dropped'] += 1
                     continue
-                if lifetime is None:
-                    self._handle(job)
-                else:
-                    with lifetime.operation() as admitted:
-                        if admitted:
-                            self._handle(job)
+                self._handle(job)
             except Exception as exc:  # noqa: BLE001 — memory must never kill a session
-                log.warning("memory writer job %s failed: %s", job.get("t"), exc)
+                self.stats['write_errors'] = self.stats.get('write_errors', 0) + 1
+                if isinstance(exc, MemoryBudgetExceeded):
+                    self.stats['budget_rejected'] = self.stats.get('budget_rejected', 0) + 1
+                log.warning("memory writer job %s failed session=%s: %s", job.get("t"), job.get('conv'), exc)
             finally:
-                job = None  # an idle worker must not retain the last frame/text payload
-                lifetime = None
-                self._q.task_done()
+                try:
+                    with self._lifecycle_lock:
+                        self._release_payload(job)
+                    job = None
+                    lifetime = None
+                    self._q.task_done()
+                finally:
+                    # Session close waits for payload release too, not just SQL.
+                    lease.__exit__(None, None, None)
 
     def _handle(self, job: Dict[str, Any]) -> None:
         kind = job.get("t")
         if kind == "utterance":
             self._handle_utterance(job)
+        elif kind == 'repeat':
+            marker = self._utterance_key(job['role'], job['text'], job.get('historical_answer', False))
+            with self._seen_lock:
+                item_id = self._seen_utterances.get(job['conv'], {}).get(marker)
+            if not self.store.note_repeat(job['conv'], job['role'], job['text'], job.get('session_ts'),
+                                          historical_answer=job.get('historical_answer', False), item_id=item_id):
+                self._handle_utterance(job)
         elif kind == "frame":
             self._handle_frame(job)
 
@@ -217,7 +281,12 @@ class MemoryWriter:
         item_id = self.store.add_item(
             conv, KIND_UTTERANCE, text=text, role=job.get("role"), lang=job.get("lang"),
             session_ts=job.get("session_ts"), media_ts=job.get("media_ts"),
-            importance=float(job.get("importance", 0.5)))
+            importance=float(job.get("importance", 0.5)), historical_answer=job.get('historical_answer', False))
+        marker = self._utterance_key(job.get('role'), text, job.get('historical_answer', False))
+        with self._seen_lock:
+            seen = self._seen_utterances.get(conv, {})
+            if marker in seen:
+                seen[marker] = item_id
         vec = self.text.encode([text])[0]
         self.store.add_vector(conv, item_id, SPACE_TEXT, vec)
         # late interaction: token matrices alongside the pooled vector. Gated on
@@ -311,6 +380,9 @@ class MemoryWriter:
             kept = [job for job in self._q.queue
                     if not (job.get("conv") == conversation_id and job.get("lifetime") is lifetime)]
             removed = len(self._q.queue) - len(kept)
+            for job in self._q.queue:
+                if job.get('conv') == conversation_id and job.get('lifetime') is lifetime:
+                    self._release_payload(job)
             self._q.queue.clear()
             self._q.queue.extend(kept)
             self._q.unfinished_tasks -= removed

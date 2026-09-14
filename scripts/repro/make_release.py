@@ -62,6 +62,7 @@ def main():
         export(ROOT, demo, ["README_zh.md", "bootstrap.sh", "services/pi_agent", "deployment/repro", "scripts/repro",
             "docs/manual_deployment.md", "docs/deployment_operations.md",
             "scripts/deploy/stop_backend.py", "scripts/deploy/memory_backend.py", "server/tests/test_repro_install.py",
+            "server/tests/test_recovery_fixes.py", "scripts/tests/realtime_recovery.cjs",
             "server/tests/test_memory_batch1.py", "server/tests/test_memory_batch2.py",
             "server/tests/test_memory_shutdown.py", "server/tests/test_deploy_shutdown.py"])
         export(args.backend.resolve(), backend, ["README_zh.md", "deployment/repro",

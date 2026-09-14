@@ -679,6 +679,9 @@ class Settings:
     media_enabled: bool = field(default_factory=lambda: _env_flag("MEDIA_ENABLED", True))
     data_dir: str = field(default_factory=lambda: _env("DATA_DIR", os.path.join(REPO_ROOT, "data")))
     history_db_path: str = field(default_factory=lambda: _env("HISTORY_DB_PATH", ""))  # "" → {data_dir}/index.db
+    history_queue_bytes: int = field(default_factory=lambda: _env_int("HISTORY_QUEUE_BYTES", 16 * 1024**2))
+    history_queue_items: int = field(default_factory=lambda: _env_int("HISTORY_QUEUE_ITEMS", 2048))
+    history_pending_sessions: int = field(default_factory=lambda: _env_int("HISTORY_PENDING_SESSIONS", 128))
     upload_max_bytes: int = field(default_factory=lambda: _env_int("UPLOAD_MAX_BYTES", 512 * 1024 * 1024))
     media_hash_algo: str = field(default_factory=lambda: _env("MEDIA_HASH_ALGO", "sha256"))
     media_thumb_max_edge: int = field(default_factory=lambda: _env_int("MEDIA_THUMB_MAX_EDGE", 512))
@@ -700,6 +703,23 @@ class Settings:
     memory_min_free_bytes: int = field(default_factory=lambda: _env_int("MEMORY_MIN_FREE_BYTES", 1024 ** 3))
     # Soft admission bound on occupied SQLite pages, not historical file size.
     memory_max_db_bytes: int = field(default_factory=lambda: _env_int("MEMORY_MAX_DB_BYTES", 2 * 1024 ** 3))
+    memory_temporal_scan_items: int = field(default_factory=lambda: _env_int("MEMORY_TEMPORAL_SCAN_ITEMS", 128))
+    memory_temporal_scan_bytes: int = field(default_factory=lambda: _env_int("MEMORY_TEMPORAL_SCAN_BYTES", 128 * 1024))
+    memory_session_max_items: int = field(default_factory=lambda: _env_int("MEMORY_SESSION_MAX_ITEMS", 5000))
+    memory_total_max_items: int = field(default_factory=lambda: _env_int("MEMORY_TOTAL_MAX_ITEMS", 20000))
+    memory_session_max_bytes: int = field(default_factory=lambda: _env_int("MEMORY_SESSION_MAX_BYTES", 64 * 1024**2))
+    memory_total_max_bytes: int = field(default_factory=lambda: _env_int("MEMORY_TOTAL_MAX_BYTES", 256 * 1024**2))
+    memory_cache_max_bytes: int = field(default_factory=lambda: _env_int("MEMORY_CACHE_MAX_BYTES", 128 * 1024**2))
+    memory_queue_max_bytes: int = field(default_factory=lambda: _env_int("MEMORY_QUEUE_MAX_BYTES", 32 * 1024**2))
+    memory_item_max_chars: int = field(default_factory=lambda: _env_int("MEMORY_ITEM_MAX_CHARS", 8192))
+    memory_session_frame_bytes: int = field(default_factory=lambda: _env_int("MEMORY_SESSION_FRAME_BYTES", 128 * 1024**2))
+    memory_total_frame_bytes: int = field(default_factory=lambda: _env_int("MEMORY_TOTAL_FRAME_BYTES", 512 * 1024**2))
+    memory_max_wal_bytes: int = field(default_factory=lambda: _env_int("MEMORY_MAX_WAL_BYTES", 128 * 1024**2))
+    memory_queue_session_bytes: int = field(default_factory=lambda: _env_int("MEMORY_QUEUE_SESSION_BYTES", 8 * 1024**2))
+    memory_frame_max_bytes: int = field(default_factory=lambda: _env_int("MEMORY_FRAME_MAX_BYTES", 2 * 1024**2))
+    memory_background_tasks: int = field(default_factory=lambda: _env_int("MEMORY_BACKGROUND_TASKS", 8))
+    memory_uncommitted_bytes: int = field(default_factory=lambda: _env_int("MEMORY_UNCOMMITTED_BYTES", 64 * 1024))
+    memory_tracked_sessions: int = field(default_factory=lambda: _env_int("MEMORY_TRACKED_SESSIONS", 128))
     # Text space: BGE-M3 (multilingual, so an English query still hits a Chinese
     # memory). Image space: Chinese-CLIP — ONE space for frames and zh text, so
     # "我刚才给你看的那个" resolves against frames directly, no captioner needed.

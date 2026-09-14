@@ -106,6 +106,41 @@ def build_recall_block(lines: Sequence[str]) -> str:
     return "\n".join([RECALL_OPEN, *lines, RECALL_CLOSE])
 
 
+def verbatim_chunks(text: str, budget: int, max_chars: int = 2000) -> List[str]:
+    """Budgeted contiguous original spans; no summary or invented content."""
+    if budget < 1:
+        return []
+    pieces = re.findall(r'.+?(?:[。！？!?]|\.(?=\s)|\n|$)', text or '', re.S)
+    result, current = [], ''
+    for sentence in pieces:
+        while sentence:
+            if len(current + sentence) <= max_chars and estimate_tokens(current + sentence) <= budget:
+                current += sentence
+                break
+            if current:
+                result.append(current.strip())
+                current = ''
+            lo, hi = 0, min(len(sentence), max_chars)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if estimate_tokens(sentence[:mid]) <= budget:
+                    lo = mid
+                else:
+                    hi = mid-1
+            if not lo:
+                return result
+            if lo < len(sentence):
+                space = sentence.rfind(' ', 0, lo)
+                if space >= lo//2:
+                    lo = space+1
+            part, sentence = sentence[:lo].strip(), sentence[lo:]
+            if part:
+                result.append(part)
+    if current:
+        result.append(current.strip())
+    return result
+
+
 def strip_recall_tags(text: str) -> str:
     """Output-side backstop: Qwen-family models occasionally echo scaffold tags."""
     if not text:

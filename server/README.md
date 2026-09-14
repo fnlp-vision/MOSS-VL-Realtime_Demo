@@ -30,6 +30,24 @@ WS /api/session/{sid}/ws  ◀── captions (response.text.delta) · TTS PCM (b
 - The legacy 3-channel routers (`voice_ws`/`realtime_ws`) are **removed** — the
   frontend speaks the session plane (overhaul §5 step 4 complete).
 
+## Context Commands
+
+Send `{"type":"text.input","text":"/compact"}` or
+`{"type":"text.input","text":"/clear"}` on the session WebSocket.
+Only an exact, trimmed command is intercepted; it is not a model prompt.
+The server emits `context.command` with `command` and `status`:
+`running`, then `completed` or `failed` (with `message`). Events are replayable
+and journaled. During execution, mic/video frames are dropped and other control
+inputs are rejected with `context_busy` (ping/playback telemetry remain allowed).
+
+`/compact` requires Memory and a summary provider; it summarizes and recreates
+the model session while retaining retrieval Memory. `/clear` needs only session
+recreation support: it removes KV, summary, session Memory and pending work,
+preserving the system prompt, transport/settings and history archive. The old
+initial user prompt and cached frame are not replayed on clear. Subsequent frames
+resume vision input. On clear failure, retry `/clear` or create a new session;
+cleared memory is not restored. No sglang-omni protocol change is required.
+
 ## Run
 
 ```bash
@@ -190,13 +208,64 @@ source changes; camera/screen frames retain their normal freshness limit.
 
 With the default system prompt and no initial task, an explicit history question
 with no prior records produces `memory.notice {code: "no_history", message: "..."}`.
-A history query may instead produce `code: "no_evidence"` when candidate
-verification finds no supporting evidence. Verification failures and context
-deduplication do not trigger this notice. The client displays and archives notices
+A bounded search or candidate-verification miss does not prove that the complete
+history or native model context lacks evidence. Such misses are logged and do not
+veto the model turn. The client displays and archives absence-of-history notices
 as system messages, not model answers. Each notice includes a `response_id` and
 is followed by `response.created`, empty `response.text.done`, and `response.done`
 with `source: "system"`. Ordinary questions still go to the model.
 Deploy the updated frontend and API together.
+
+Earliest/first/latest/last event questions use a bounded chronological text scan
+in addition to semantic search, not a fixed first-minute window. Batches are
+verified in the requested time order before context deduplication. Whole-record
+timestamps and original within-record order are preserved; precise event times
+are not invented. Repeated identical observations retain first/last observation
+times without duplicate vectors; historical QA retellings are excluded from
+event-order scans. Pre-upgrade rows lack those annotations and cannot reconstruct
+lost repeat times. The default scan is 128 records / 128 KiB under the existing
+8-second decision budget. Missing timestamps, truncated text, scan exhaustion and
+selector errors are not proof of absence. Diagnostics include candidate IDs,
+timestamps, lengths and stage outcomes, not additional history bodies.
+
+Long records are split into budgeted original-text spans before temporal evidence
+selection; no generated summary replaces the source. Injection coverage is tracked
+per span so retaining one excerpt does not suppress a different excerpt from the
+same record. The frontend continues to show the original source record.
+
+### Resource Budgets
+
+Limits apply to retrieval memory, not model weights or total process RSS. SQLite,
+NumPy and Python may retain reusable allocations after a session closes.
+
+| Resource | Default | Configuration |
+| --- | --- | --- |
+| Stored items, session / total | 5000 / 20000 | `MEMORY_SESSION_MAX_ITEMS`, `MEMORY_TOTAL_MAX_ITEMS` |
+| Text/vector/key bytes, session / total | 64 / 256 MiB | `MEMORY_SESSION_MAX_BYTES`, `MEMORY_TOTAL_MAX_BYTES` |
+| Retained vector cache | 128 MiB | `MEMORY_CACHE_MAX_BYTES` |
+| Queued + in-flight payload, total / session | 32 / 8 MiB | `MEMORY_QUEUE_MAX_BYTES`, `MEMORY_QUEUE_SESSION_BYTES` |
+| Temporary frames, session / total | 128 / 512 MiB | `MEMORY_SESSION_FRAME_BYTES`, `MEMORY_TOTAL_FRAME_BYTES` |
+| One frame / text record | 2 MiB / 8192 characters | `MEMORY_FRAME_MAX_BYTES`, `MEMORY_ITEM_MAX_CHARS` |
+| WAL pressure threshold | 128 MiB | `MEMORY_MAX_WAL_BYTES` |
+| Tracked active/pending-cleanup sessions | 128 | `MEMORY_TRACKED_SESSIONS` |
+| Fact tasks / interrupted-text buffer per session | 8 / 64 KiB | `MEMORY_BACKGROUND_TASKS`, `MEMORY_UNCOMMITTED_BYTES` |
+| Injection per turn / session lifetime | 180 / 1200 estimated tokens | `MEMORY_INJECT_MAX_TOKENS`, `MEMORY_INJECT_SESSION_MAX_TOKENS` |
+
+Over-budget writes are rejected, existing evidence is retained, and resource
+status/counters (`/api/status.memory` and `/api/status.memory_writer`) expose
+degradation, cached bytes and pending payloads. Cache eviction removes only recomputable
+RAM indexes, not stored evidence. The status byte count excludes Python object
+overhead and temporary embedding/search workspace; it is not an RSS hard quota.
+Database/free-disk/WAL checks remain periodic soft admission controls. Online WAL
+checkpoint/truncation does not wait for old readers; persistent readers may keep
+admission paused until the next maintenance pass can reclaim the WAL.
+
+History recording has separate limits: `HISTORY_QUEUE_BYTES` (16 MiB),
+`HISTORY_QUEUE_ITEMS` (2048), and `HISTORY_PENDING_SESSIONS` (128). A session whose
+archive overflows stops accepting further archive events, logs the failure and
+is finalized with an `archive_incomplete` marker. `/api/status.history` exposes
+queue use and errors. Finalization has bounded reserved bookkeeping; shutdown
+waits for accepted writes instead of closing the index under an active writer.
 
 On context rollover, the gateway probes `/v1/video/realtime/capabilities` and uses
 role-preserving `prefill_messages` when supported. Update the realtime backend
@@ -245,6 +314,23 @@ deletion does not remove the corresponding media index row.
 ```bash
 .venv/bin/python scripts/history_prune.py --unreferenced --dry-run
 .venv/bin/python scripts/history_prune.py --unreferenced --offline --older-than 1
+```
+
+### Archive Retention
+
+Retention is opt-in and offline. `scripts/history_retention.py` previews only by
+default; `--apply --offline` plus an explicit policy is required for deletion.
+It selects closed conversations oldest first, protects remaining history/memory
+media references, and refuses to run while an updated API holds its archive lock.
+Age is based on `ended_at`; unclosed records are preserved. `--max-bytes` targets
+journal/media payload, not allocated SQLite pages, caches, backups or log files.
+An unmet target (protected content or batch limit) is reported rather than hidden.
+No automatic archive-deletion schedule is installed.
+
+```bash
+.venv/bin/python scripts/history_retention.py --days 90
+# Only after approving that policy and stopping all APIs:
+.venv/bin/python scripts/history_retention.py --days 90 --apply --offline
 ```
 
 Two durable archives under `DATA_DIR` — nothing auto-evicts:

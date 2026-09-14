@@ -142,6 +142,9 @@ class Orchestrator:
         self._reseat_in_progress = False
         self._reseat_lock = asyncio.Lock()
         self._reseat_task: Optional[asyncio.Task] = None
+        self._context_command: Optional[str] = None
+        self._audio_task: Optional[asyncio.Task] = None
+        self._context_epoch = 0
         # failure relay (GATEWAY_PLAN P2): a dead VLM transport gets ONE memory
         # -prefix re-seat attempt before the terminal state; reset on every
         # successful reseat so a later death can relay again
@@ -232,6 +235,8 @@ class Orchestrator:
             task = asyncio.get_running_loop().create_task(
                 coro, name=f"orch-{name}-{self.state.session_id[:12]}")
             self._tasks.append(task)
+            if name == "audio":
+                self._audio_task = task
             if name == "vlm":
                 # tracked by name: a rollover re-seat cancels and recreates it
                 self._vlm_drain_task = task
@@ -289,7 +294,7 @@ class Orchestrator:
     # ------------------------------------------------------------------ ingress (from the WS router)
 
     def push_pcm(self, pcm: bytes) -> None:
-        if self._closed or not pcm:
+        if self._closed or self._context_command or not pcm:
             return
         if len(self._audio_in) >= self._audio_in_max:
             # drop the oldest PCM chunk (never a control marker) to bound latency
@@ -308,7 +313,7 @@ class Orchestrator:
         self._audio_event.set()
 
     async def push_frame(self, jpeg: bytes, timestamp: Optional[float]) -> None:
-        if self._closed:
+        if self._closed or self._context_command:
             return
         if not looks_like_jpeg(jpeg):
             self._emit_error("bad_frame", "frame payload is not a JPEG")
@@ -459,6 +464,9 @@ class Orchestrator:
     async def handle_event(self, type_: str, payload: Dict[str, Any]) -> None:
         if self._closed:
             return
+        if self._context_command and type_ not in (p.CLIENT_PING, p.CLIENT_PLAYBACK_STATUS):
+            self._emit_error("context_busy", "Context command is still running")
+            return
         if type_ == p.CLIENT_PING:
             self.state.emit(p.PONG, transient=True, ping_seq=payload.get("seq"))
         elif type_ == p.CLIENT_SESSION_UPDATE:
@@ -474,6 +482,16 @@ class Orchestrator:
                 await self._cancel_response(p.STOP_CANCELLED)
         elif type_ == p.CLIENT_TEXT_INPUT:
             text = str(payload.get("text") or "").strip()
+            if text in ("/compact", "/clear"):
+                if self._reseat_factory is None or (text == "/compact" and self._rollover is None):
+                    self._emit_error("context_unavailable", "Context command is unavailable for this session")
+                    return
+                self._context_command = text
+                self._context_epoch += 1
+                self.state.emit(p.CONTEXT_COMMAND, command=text, status="running")
+                task = asyncio.create_task(self._run_context_command(text), name="orch-context-command")
+                self._tasks.append(task)
+                return
             if text:
                 # echo the accepted typed turn (replay + history parity with ASR)
                 self.state.emit(p.TEXT_DONE, text=text, item_id=f"item_{next(self._serial)}",
@@ -597,7 +615,17 @@ class Orchestrator:
             return
         if self.engines.asr is None:
             raise RuntimeError("ASR is not available for this session")
-        self._asr_stream = await asyncio.to_thread(self.engines.asr.open_stream, self._on_asr_partial)
+        epoch = self._context_epoch
+        def partial(text):
+            if epoch == self._context_epoch:
+                self._on_asr_partial(text)
+        opening = asyncio.create_task(asyncio.to_thread(self.engines.asr.open_stream, partial))
+        try:
+            self._asr_stream = await asyncio.shield(opening)
+        except asyncio.CancelledError:
+            late_stream = await opening
+            await asyncio.to_thread(late_stream.close)
+            raise
         self._asr_committed = False
         self._meter.reset()
 
@@ -606,7 +634,11 @@ class Orchestrator:
 
         Partials are transient: they describe the moment, never replay after a
         reconnect, and are not journaled (the final transcription.done is)."""
+        if self._context_command or self._closed:
+            return
         def emit() -> None:
+            if self._context_command or self._closed:
+                return
             self.state.emit(p.TRANSCRIPTION_DELTA, transient=True, text=text)
         try:
             self._loop.call_soon_threadsafe(emit)
@@ -713,17 +745,11 @@ class Orchestrator:
         recall = await self._recall_for_turn(text)
         if self._closed:
             return
-        if (self.memory is not None and getattr(recall, 'reason', None) == 'no_evidence'
-                and not (self.state.config.initial_prompt or self.settings.initial_prompt)):
-            from ..memory.retrieval import is_history_question
-            from ..memory.rollover import _default_system_prompt
-            if is_history_question(text) and (not self.state.config.system_prompt or self.state.config.system_prompt.strip() == _default_system_prompt().strip()):
-                message = ('本轮没有找到可核对的历史依据，无法确认。'
-                           if self.memory.language.startswith('zh') else
-                           'No supporting history was found for this question.')
-                self._emit_memory_notice(text, 'no_evidence', message)
-                self._pending_source_notes = notes + self._pending_source_notes
-                return
+        if getattr(recall, 'reason', None):
+            # A bounded candidate search cannot prove absence from native KV
+            # or the complete history. Do not turn its miss into a system veto.
+            log.info('memory recall outcome session=%s reason=%s',
+                     self.state.session_id, recall.reason)
         # user text is sanitized because split_special_tokens=False: a literal
         # `<think>` or `<|im_end|>` in ASR/typed input would otherwise tokenize
         # as a real control token and corrupt the chat scaffold
@@ -740,6 +766,7 @@ class Orchestrator:
                                    (time.monotonic() - latest[2]) <= self.settings.frame_max_age_s):
             frame = latest
         for attempt in range(2):
+            injection_position = self._last_text_tokens
             try:
                 if frame is not None:
                     await asyncio.to_thread(
@@ -748,6 +775,10 @@ class Orchestrator:
                     await asyncio.to_thread(self.engines.vlm.put_prompt, vlm_text)
                 if self.memory is not None:
                     self.memory.note_context_turn('user', text)
+                    if recall and not self._closed:
+                        self.memory.mark_injected(recall.ids, text_tokens=injection_position, block=recall.block)
+                        self.state.emit(p.MEMORY_RECALLED, items=recall.items)
+                        log.info('memory: recalled %d item(s) for %s', len(recall.ids), self.state.session_id)
                 break
             except Exception as exc:
                 if type(exc).__name__ == "ContextRolloverRequired" and attempt == 0:
@@ -802,9 +833,7 @@ class Orchestrator:
             # never ambient
             if self._closed:
                 return mem_session.EMPTY_RECALL
-            self.memory.mark_injected(recall.ids, text_tokens=self._last_text_tokens)
-            self.state.emit(p.MEMORY_RECALLED, items=recall.items)
-            log.info("memory: recalled %d item(s) for %s", len(recall.ids), self.state.session_id)
+            # The caller commits bookkeeping/events only after prompt submission.
         return recall
 
     def _note_memory_turn(self, role: str, text: str, *, commit: bool = True) -> None:
@@ -817,7 +846,11 @@ class Orchestrator:
             else:
                 # commit=False (barge-in / <|eot_id|> interrupted): the text stays
                 # as compact-journal context but never enters long-term memory
-                self.memory.note_assistant_turn(text, media_ts=media_ts, commit=commit)
+                from ..memory.retrieval import is_history_question
+                from ..memory.rewrite import temporal_order
+                self.memory.note_assistant_turn(text, media_ts=media_ts, commit=commit,
+                    historical_answer=(is_history_question(self._pending_fact_user_text or '') or
+                                       temporal_order(self._pending_fact_user_text or '') is not None))
                 if commit:
                     self.memory.note_context_turn('assistant', text)
         except Exception as exc:  # noqa: BLE001
@@ -831,6 +864,9 @@ class Orchestrator:
             return
         user_text, self._pending_fact_user_text = self._pending_fact_user_text, None
         if not user_text:
+            return
+        if len(self._memory_tasks) >= max(1, self.settings.memory_background_tasks):
+            self.metrics['memory_fact_tasks_skipped'] = self.metrics.get('memory_fact_tasks_skipped', 0) + 1
             return
         try:
             task = asyncio.get_running_loop().create_task(
@@ -1326,6 +1362,47 @@ class Orchestrator:
 
     # ------------------------------------------------------------------ rollover (design §6)
 
+    async def _run_context_command(self, command: str) -> None:
+        try:
+            # Quiesce ASR (including any recall it is awaiting) and output before
+            # touching the old memory lifetime. Threaded work is drained on clear.
+            if self._audio_task is not None:
+                self._audio_task.cancel()
+                await asyncio.gather(self._audio_task, return_exceptions=True)
+            self._audio_in.clear()
+            await self._abort_capture()
+            async with self._reseat_lock:
+                if self._closed:
+                    return
+                self._reseat_in_progress = True
+                if self._vlm_drain_task is not None:
+                    self._vlm_drain_task.cancel()
+                    await asyncio.gather(self._vlm_drain_task, return_exceptions=True)
+                await self._cancel_response(p.STOP_INTERRUPTED)
+                self._pending_turn_t0 = None
+                self._pending_fact_user_text = None
+                await self._perform_reseat_vlm(trigger="clear" if command == "/clear" else "manual")
+            if not self._closed:
+                self.state.emit(p.CONTEXT_COMMAND, command=command, status="completed")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("context command %s failed for %s", command, self.state.session_id)
+            if not self._closed:
+                self.state.emit(p.CONTEXT_COMMAND, command=command, status="failed", message=str(exc))
+        finally:
+            self._reseat_in_progress = False
+            self._context_command = None
+            if not self._closed:
+                self._audio_task = asyncio.create_task(self._audio_loop(), name="orch-audio")
+                self._tasks.append(self._audio_task)
+                if not self._vlm_dead and (self._vlm_drain_task is None or self._vlm_drain_task.done()):
+                    self._vlm_drain_task = asyncio.create_task(self._vlm_drain_loop(), name="orch-vlm")
+                    self._tasks.append(self._vlm_drain_task)
+                # Do not retain completed command/replaced lane tasks forever.
+                current = asyncio.current_task()
+                self._tasks[:] = [t for t in self._tasks if t is not current and not t.done()]
+
     def _context_requires_rollover(self) -> bool:
         try:
             return bool(self.engines.vlm.status().get("context", {}).get("rollover_required"))
@@ -1354,7 +1431,7 @@ class Orchestrator:
         hook (the 1 Hz status tick re-checks, so the hard trigger still
         guarantees eventual firing — it exists to interrupt silence, not speech).
         """
-        if self._closed or self._reseat_in_progress or self._vlm_dead:
+        if self._closed or self._context_command or self._reseat_in_progress or self._vlm_dead:
             return
         if self._reseat_task is not None and not self._reseat_task.done():
             return
@@ -1392,10 +1469,10 @@ class Orchestrator:
         self._tasks.append(task)
         self._reseat_task = task
 
-    async def _call_reseat_factory(self, prefill_json: str) -> Any:
+    async def _call_reseat_factory(self, prefill_json: str, *, clear: bool = False) -> Any:
         """The factory may be sync or async (tests inject plain callables)."""
         result = self._reseat_factory(
-            prompt=self.state.config.initial_prompt
+            prompt="" if clear else self.state.config.initial_prompt
             if self.state.config.initial_prompt is not None else self.settings.initial_prompt,
             system_prompt=self.state.config.system_prompt,
             prefill_messages=prefill_json)
@@ -1439,19 +1516,56 @@ class Orchestrator:
         old_stopped = False
         new = None
         try:
-            if trigger == "context":
+            if trigger in ("context", "clear"):
                 # Hard budget: stop growth while rebuilding the memory prefix.
                 await self._cancel_response(p.STOP_INTERRUPTED)
                 old_stopped = True
                 await asyncio.to_thread(old.stop, 5.0)
-            prefill, kept_ids, est_tokens = await self._rollover.build_prefix()
+            if trigger == "clear":
+                self._latest_frame = None
+                self._pending_source_notes.clear()
+                if self._rollover is not None:
+                    self._rollover.seal()
+                if self.memory is not None:
+                    self.memory.lifetime.seal()
+                tasks = list(self._memory_tasks)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                if self._rollover is not None:
+                    await asyncio.to_thread(self._rollover.close)
+                if self.memory is not None:
+                    # Shield the replacement: cleanup cannot race a late threaded
+                    # reset creating a fresh lifetime after conversation shutdown.
+                    reset = asyncio.create_task(asyncio.to_thread(self.memory.cleared_copy))
+                    try:
+                        self.memory = await asyncio.shield(reset)
+                    except asyncio.CancelledError:
+                        fresh = await reset
+                        await asyncio.to_thread(fresh.close)
+                        raise
+                    if self._rollover is not None:
+                        self._rollover = self._rollover.cleared_copy(self.memory)
+                from ..memory.rollover import _default_system_prompt
+                system = self.state.config.system_prompt
+                if system is None:
+                    system = _default_system_prompt()
+                prefill = [{"role": "system", "content": system}]
+                kept_ids, est_tokens = [], mem_inject.estimate_tokens(system)
+            elif trigger == "manual":
+                await asyncio.to_thread(self.memory.writer.drain)
+                prefill, kept_ids, est_tokens = await self._rollover.build_prefix(require_summary=True)
+                if not prefill:
+                    raise RuntimeError("Context compaction was cancelled")
+            else:
+                prefill, kept_ids, est_tokens = await self._rollover.build_prefix()
             if self._closed:
                 return
             prefill_json = json.dumps(prefill, ensure_ascii=False)
             log.info("rollover (%s) for %s: prefix ~%d est tokens, %d kept items, %d messages",
                      trigger, self.state.session_id, est_tokens, len(kept_ids), len(prefill))
             try:
-                new = await self._call_reseat_factory(prefill_json)
+                new = await self._call_reseat_factory(prefill_json, clear=trigger == "clear")
             except Exception as exc:  # noqa: BLE001 — classified below
                 capacity_conflict = type(exc).__name__ == "NoFreeReplica" or "already running" in str(exc)
                 if not capacity_conflict or old_stopped:
@@ -1459,7 +1573,7 @@ class Orchestrator:
                 log.info("rollover reseat: no free replica; stopping the old engine first")
                 old_stopped = True
                 await asyncio.to_thread(old.stop, 5.0)
-                new = await self._call_reseat_factory(prefill_json)
+                new = await self._call_reseat_factory(prefill_json, clear=trigger == "clear")
             if self._closed:
                 await asyncio.to_thread(new.stop, 5.0)
                 return
@@ -1486,7 +1600,8 @@ class Orchestrator:
                 await asyncio.to_thread(new.put_frame, latest[0], latest[1], len(latest[0]))
             # the injected set is recomputed from EXACTLY what went into the new
             # prefix (design §5); distances reset to the new prefix's size
-            self.memory.note_rollover(kept_ids, text_tokens=float(est_tokens))
+            if self.memory is not None:
+                self.memory.note_rollover(kept_ids, text_tokens=float(est_tokens))
             self._last_text_tokens = float(est_tokens)
             self._last_rollover_at = time.monotonic()
             # a successful reseat re-arms the failure relay: the NEXT transport
@@ -1507,6 +1622,8 @@ class Orchestrator:
                 # terminal state a VLM crash would (today's behaviour without
                 # rollover); _failure_relay_attempted guards against recursion.
                 self._vlm_dead_final(f"rollover reseat failed: {exc}")
+            if trigger in ("manual", "clear"):
+                raise
         finally:
             self._reseat_in_progress = False
 

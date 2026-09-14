@@ -1,7 +1,7 @@
 """History recorder — JSONL journal (source of truth) + SQLite index writer.
 
-One daemon writer thread (the TtsSession pattern: `queue.Queue`, `None`
-sentinel, `join(timeout)` on close) owns every history write. Producers —
+One daemon writer thread with a bounded payload queue and reserved finalization
+bookkeeping owns every history write. Shutdown drains accepted work. Producers —
 `SessionState.emit`'s record sink on the event loop, the chat router — only
 `queue.put_nowait`, so recording can never stall captions or TTS.
 
@@ -41,6 +41,7 @@ JOURNAL_TYPES = frozenset({
     "response.done",
     "session.updated",
     "memory.notice",
+    "context.command",
 })
 
 _TITLE_MAX = 80
@@ -56,7 +57,14 @@ class HistoryRecorder:
         self.settings = settings
         self.index = index
         self.journal_root = os.path.join(settings.data_dir, "journal")
-        self._queue: "queue.Queue[Optional[Tuple[str, tuple]]]" = queue.Queue()
+        self._queue = queue.Queue(maxsize=max(1, settings.history_queue_items))
+        self._admission_lock = threading.RLock()
+        self._wakeup = threading.Event()
+        self._queued_bytes = 0
+        self._tracked = set()
+        self._failed_cids = set()
+        self._pending_fin = {}
+        self._stats = {'rejected': 0, 'write_errors': 0}
         self._worker: Optional[threading.Thread] = None
         self._closed = threading.Event()
         # writer-thread state
@@ -66,31 +74,74 @@ class HistoryRecorder:
     # ------------------------------------------------------------------ lifecycle
 
     def open(self) -> None:
+        if self._worker is not None:
+            return
+        self._closed.clear()
         os.makedirs(self.journal_root, exist_ok=True)
         self._worker = threading.Thread(target=self._loop, name="history-writer", daemon=True)
         self._worker.start()
         log.info("history recorder open: %s", self.journal_root)
 
-    def close(self) -> None:
+    def close(self, timeout=None) -> None:
         """Flush + stop the writer (blocking — call via asyncio.to_thread)."""
         self._closed.set()
-        self._queue.put(None)
+        self._wakeup.set()
         if self._worker is not None:
-            self._worker.join(timeout=5.0)
+            self._worker.join(timeout=timeout)
+            if self._worker.is_alive():
+                raise TimeoutError('History writer is still flushing; archive lock retained')
             self._worker = None
+        self._paths.clear()
+        self._resp_text.clear()
+
+    def status(self):
+        with self._admission_lock:
+            return {**self._stats, 'queue_bytes': self._queued_bytes,
+                    'pending_sessions': len(self._tracked), 'incomplete_sessions': len(self._failed_cids)}
+
+    def _enqueue(self, op, args):
+        cid = args[0]
+        size = len(json.dumps(args, ensure_ascii=False).encode('utf-8'))
+        with self._admission_lock:
+            if self._closed.is_set():
+                return False
+            fresh = op == 'conv' and cid not in self._tracked
+            if (not isinstance(cid, str) or len(cid) > 256 or
+                    (fresh and len(self._tracked) >= max(1, self.settings.history_pending_sessions))):
+                self._stats['rejected'] += 1
+                log.error('history recording admission limit; conversation not archived')
+                return False
+            if fresh:
+                self._tracked.add(cid)
+            if cid not in self._tracked or cid in self._failed_cids:
+                return False
+            if self._queue.full() or self._queued_bytes + size > max(1, self.settings.history_queue_bytes):
+                self._stats['rejected'] += 1
+                if fresh:
+                    self._tracked.remove(cid)
+                else:
+                    self._failed_cids.add(cid)
+                log.error('history queue budget exceeded; archive incomplete for %s', cid)
+                return False
+            self._queue.put_nowait((op, args, size))
+            if op == 'conv':
+                self._pending_fin.pop(cid, None)
+            self._queued_bytes += size
+            self._wakeup.set()
+            return True
 
     # ------------------------------------------------------------------ producers (thread-safe, non-blocking)
 
     def open_conversation(self, conversation_id: str, kind: str,
                           config: Optional[Dict[str, Any]] = None,
                           created_at: Optional[float] = None) -> None:
-        self._queue.put_nowait(("conv", (conversation_id, kind, created_at or time.time(), config)))
+        self._enqueue("conv", (conversation_id, kind, created_at or time.time(), config))
 
     def realtime_sink(self, conversation_id: str) -> Callable[[str, str], None]:
         """The `SessionState.record` sink: filter to JOURNAL_TYPES, then enqueue."""
         def sink(type_: str, text: str) -> None:
             if type_ in JOURNAL_TYPES:
-                self._queue.put_nowait(("event", (conversation_id, time.time(), text)))
+                self._enqueue("event", (conversation_id, time.time(), text))
         return sink
 
     def record_turn(self, conversation_id: str, *, role: str, text: str,
@@ -98,15 +149,18 @@ class HistoryRecorder:
                     media_hashes: Sequence[str] = (),
                     metrics: Optional[Dict[str, Any]] = None) -> None:
         """Direct turn commit (the chat path journals `history.turn` lines)."""
-        self._queue.put_nowait(("turn", (conversation_id, {
+        self._enqueue("turn", (conversation_id, {
             "type": "history.turn", "ts": ts or time.time(), "role": role,
             "source": source, "text": text, "media": list(media_hashes),
             "metrics": metrics or None,
-        })))
+        }))
 
     def finalize(self, conversation_id: str, end_reason: Optional[str] = None,
                  ended_at: Optional[float] = None) -> None:
-        self._queue.put_nowait(("fin", (conversation_id, ended_at or time.time(), end_reason)))
+        with self._admission_lock:
+            if conversation_id in self._tracked and not self._closed.is_set():
+                self._pending_fin[conversation_id] = (conversation_id, ended_at or time.time(), (end_reason or '')[:512])
+                self._wakeup.set()
 
     # ------------------------------------------------------------------ deletion (called via asyncio.to_thread)
 
@@ -117,14 +171,17 @@ class HistoryRecorder:
         the conversation on rebuild. Blobs stay until the prune tool collects
         ref_count==0 media.
         """
-        deleted = self.index.delete_conversation(conversation_id)
+        if not conversation_id or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in conversation_id):
+            raise ValueError('Unsafe conversation ID')
+        deleted = False
         pattern = os.path.join(self.journal_root, "*", "*", f"{conversation_id}.jsonl")
         for path in glob.glob(pattern):
             try:
                 os.unlink(path)
                 deleted = True
-            except OSError as exc:
-                log.warning("journal delete failed for %s: %s", path, exc)
+            except FileNotFoundError:
+                pass
+        deleted = self.index.delete_conversation(conversation_id) or deleted
         self._paths.pop(conversation_id, None)
         return deleted
 
@@ -132,10 +189,24 @@ class HistoryRecorder:
 
     def _loop(self) -> None:
         while True:
-            job = self._queue.get()
-            if job is None:
-                return
-            op, args = job
+            self._wakeup.wait()
+            queued = False
+            with self._admission_lock:
+                try:
+                    op, args, size = self._queue.get_nowait()
+                    queued = True
+                except queue.Empty:
+                    if self._pending_fin:
+                        cid = next(iter(self._pending_fin))
+                        args = self._pending_fin.pop(cid)
+                        op, size = 'fin', 0
+                    elif self._closed.is_set():
+                        self._tracked.clear()
+                        self._failed_cids.clear()
+                        return
+                    else:
+                        self._wakeup.clear()
+                        continue
             try:
                 if op == "conv":
                     self._do_conv(*args)
@@ -146,7 +217,22 @@ class HistoryRecorder:
                 elif op == "fin":
                     self._do_finalize(*args)
             except Exception as exc:  # noqa: BLE001
+                with self._admission_lock:
+                    self._stats['write_errors'] += 1
+                    self._failed_cids.add(args[0])
                 log.exception("history write failed (%s): %s", op, exc)
+            finally:
+                with self._admission_lock:
+                    self._queued_bytes -= size
+                    if op == 'fin':
+                        self._tracked.discard(args[0])
+                        self._failed_cids.discard(args[0])
+                        self._paths.pop(args[0], None)
+                        for key in [k for k in self._resp_text if k[0] == args[0]]:
+                            self._resp_text.pop(key, None)
+                if queued:
+                    self._queue.task_done()
+                args = None
 
     def _journal_path(self, cid: str, ts: float) -> str:
         path = self._paths.get(cid)
@@ -189,6 +275,8 @@ class HistoryRecorder:
         _apply_turn(self.index, cid, record)
 
     def _do_finalize(self, cid: str, ended_at: float, end_reason: Optional[str]) -> None:
+        if cid in self._failed_cids:
+            end_reason = (end_reason or '') + '|archive_incomplete'
         self.index.finalize_conversation(cid, ended_at, end_reason)
         self._append(cid, ended_at, {
             "type": "history.finalize", "ts": ended_at, "end_reason": end_reason,

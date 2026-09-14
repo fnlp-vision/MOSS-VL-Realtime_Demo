@@ -63,7 +63,7 @@ class RecallRegression(unittest.TestCase):
                 self.assertEqual(calls, [], "decision veto must precede search")
                 response.update(retrieve=True, query="unrelated")
                 session._injected.clear()
-                self.assertFalse(session.recall_for_turn(query), "weak evidence must still fail admission")
+                self.assertTrue(session.recall_for_turn(query), "temporal lookup judges the original question independently of semantic Top-K")
             finally:
                 writer.stop()
                 store.close()

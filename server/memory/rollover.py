@@ -175,7 +175,7 @@ class RolloverManager:
     # ------------------------------------------------------------------ prefix build
 
     @while_open(([], [], 0))
-    async def build_prefix(self) -> Tuple[List[dict], List[int], int]:
+    async def build_prefix(self, *, require_summary: bool = False) -> Tuple[List[dict], List[int], int]:
         """(prefill_messages, kept_item_ids, est_prefix_tokens).
 
         `kept_item_ids` are EXACTLY the journal ids whose content went into the
@@ -195,11 +195,20 @@ class RolloverManager:
                 has_extra = bool(self._journal_extra and self._journal_extra())
             except Exception:
                 has_extra = True
-            if old_journal == journal and not has_extra:
+            if old_journal == journal and not has_extra and (summary or not require_summary):
                 return self._assemble(summary, pins=pins, collected=(journal, pinned, tail))
             log.info("rollover compact prefetch stale; rebuilding from current journal")
         summary, pins = await self._summarize_full(journal)
+        if require_summary and not summary:
+            raise RuntimeError("No summary produced; existing context was not replaced")
         return self._assemble(summary, pins=pins, collected=(journal, pinned, tail))
+
+    def cleared_copy(self, memory) -> "RolloverManager":
+        return RolloverManager(
+            self.settings, self.store, self.conversation_id, plane=self.plane,
+            base_system_prompt=self.base_system_prompt, semaphore=self._semaphore,
+            pi=self.pi, lifetime=memory.lifetime, lang_getter=lambda: memory.language,
+            journal_extra=memory.uncommitted_turns)
 
     # ------------------------------------------------------------------ internals
 

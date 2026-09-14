@@ -41,7 +41,7 @@ def build_memory(settings: Settings, media: Any = None):
     try:
         store = MemoryStore(settings)
         if settings.media_enabled:
-            store.frames = SessionFrames(store.path)
+            store.frames = SessionFrames(store.path, settings)
         writer = MemoryWriter(settings, store, media=media)
         return store, writer
     except Exception as exc:  # noqa: BLE001 — never block boot on memory

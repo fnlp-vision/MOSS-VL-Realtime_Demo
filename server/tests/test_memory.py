@@ -229,14 +229,14 @@ def test_lifetime_budget() -> None:
     """Lifetime injected-token exhaustion stops recall SILENTLY (rollover signal)."""
     with tempfile.TemporaryDirectory() as tmp:
         s, store, writer, sess = _make_session(
-            tmp, MEMORY_REINJECT_DISTANCE=0, MEMORY_INJECT_SESSION_MAX_TOKENS=10)
+            tmp, MEMORY_REINJECT_DISTANCE=0, MEMORY_INJECT_SESSION_MAX_TOKENS=30)
         sess.note_user_turn("我刚买了一台尼康 FM2 胶片相机，很喜欢")
         writer.drain()
         query = "我刚才说的那台胶片相机是什么型号"
         first = sess.recall_for_turn(query)
         assert first
         sess.mark_injected(first.ids)
-        assert sess._lifetime_tokens >= 10
+        assert 0 < sess._lifetime_tokens <= 30
         assert not sess.recall_for_turn(query), "lifetime budget exhausted but recall continued"
         writer.stop()
         store.close()

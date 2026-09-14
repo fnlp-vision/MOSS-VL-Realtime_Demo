@@ -152,6 +152,8 @@ async def health() -> Dict[str, Any]:
 @router.get("/status")
 async def status(rt: Runtime = Depends(get_runtime)) -> Dict[str, Any]:
     gauge = _loop_lag_gauge
+    memory = getattr(rt, 'memory_store', None)
+    writer = getattr(rt, 'memory_writer', None)
     return {
         "ok": True,
         "boot": BOOT_INFO,
@@ -160,6 +162,9 @@ async def status(rt: Runtime = Depends(get_runtime)) -> Dict[str, Any]:
         # loaded:false = plane exists but down (chat is FALLING BACK right now)
         "vlm_offline": rt.vlm_offline.status() if getattr(rt, "vlm_offline", None) else None,
         "voice": rt.voice_status(),
+        "history": rt.history.status() if getattr(rt, 'history', None) is not None else None,
+        "memory": await asyncio.to_thread(memory.resource_status) if memory is not None else None,
+        "memory_writer": writer.status() if writer is not None else None,
         "capture_mode": rt.settings.capture_mode,
         "sessions": rt.session_manager.list_snapshots(),
         "placement": _placement_summary(rt),

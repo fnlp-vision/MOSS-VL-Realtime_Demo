@@ -49,6 +49,17 @@ _SESSION_START_ZH = ("最开始", "一开始", "第一句", "开头")
 _SESSION_START_EN = ("first thing", "very first", "at the beginning", "at the start",
                      "beginning of")
 _SESSION_START_WINDOW_S = 60.0
+
+
+def temporal_order(text: str) -> Optional[str]:
+    """Event order is distinct from a fixed window at session start."""
+    if not re.search(r'什么|哪|几|回忆|告诉|[?？]|\b(?:what|which|when|recall|show)\b', text or '', re.I):
+        return None
+    if re.search(r'最早|首次|第一(?:个|次)|第1(?:个|次)|最先|最初|\b(?:first|earliest)\b', text or '', re.I):
+        return 'earliest'
+    if re.search(r'最后(?:一次)?|最近一次|\b(?:last|latest|most recent)\b', text or '', re.I):
+        return 'latest'
+    return None
 _ZH_AGO_RE = re.compile(r"(\d{1,4})\s*(秒|分钟?|个?小时|个?钟头)前")
 _EN_AGO_RE = re.compile(r"\b(\d{1,4})\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\s+ago\b",
                         re.IGNORECASE)

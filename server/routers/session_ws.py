@@ -82,6 +82,7 @@ async def session_ws(websocket: WebSocket, sid: str):
                 last_sent = item.seq
 
         closer = asyncio.create_task(close_event.wait())
+        getter = None
         try:
             while True:
                 getter = asyncio.create_task(state.out_queue.get())
@@ -101,6 +102,10 @@ async def session_ws(websocket: WebSocket, sid: str):
                     return
         finally:
             closer.cancel()
+            if getter is not None:
+                getter.cancel()
+            await asyncio.gather(closer, *([getter] if getter is not None else []),
+                                 return_exceptions=True)
 
     async def inbound() -> None:
         while True:

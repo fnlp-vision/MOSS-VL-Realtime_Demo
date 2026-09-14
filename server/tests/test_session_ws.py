@@ -122,6 +122,7 @@ async def start_server() -> Tuple[uvicorn.Server, asyncio.Task, str, Runtime]:
 
     fake_rt = make_fake_runtime()
     app_module.build_runtime = lambda plan=None: fake_rt  # lifespan resolves this at call time
+    app_module.get_settings = lambda: dataclasses.replace(fake_rt.settings, tts_spawn=False)
 
     config = uvicorn.Config(app_module.app, host="127.0.0.1", port=0,
                             log_level="warning", lifespan="on")

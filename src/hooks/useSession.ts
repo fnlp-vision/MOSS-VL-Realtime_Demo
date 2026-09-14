@@ -176,6 +176,8 @@ export function useSession(callbacks: UseSessionCallbacks) {
   const aiSentencesRef = useRef(0); // sentences already committed for the open response
   const lastEmittedAtRef = useRef<number | null>(null); // server gen time of the latest delta
   const activeRef = useRef(false);
+  const connectGenerationRef = useRef(0);
+  const micSetupAbortRef = useRef<AbortController | null>(null);
   // --- text-generation throughput (drives the orb) ---
   // genRate: smoothed chars/sec, estimated from inter-delta timing.
   // genLevel: the final buttery 0..1 the orb reads via getGenLevel() — swells
@@ -192,6 +194,9 @@ export function useSession(callbacks: UseSessionCallbacks) {
 
   const teardown = useCallback((deleteSession: boolean) => {
     activeRef.current = false;
+    connectGenerationRef.current += 1;
+    micSetupAbortRef.current?.abort();
+    micSetupAbortRef.current = null;
     // A session cut mid-response leaves the words already streamed in the
     // transcript: flush the reply buffer's uncommitted sentences + open tail
     // as bubbles (the samp controller does the same on a scripted mid-stop).
@@ -303,6 +308,21 @@ export function useSession(callbacks: UseSessionCallbacks) {
         });
         break;
       }
+      case 'context.command': {
+        const command = String(ev.command ?? '');
+        const status = String(ev.status ?? '');
+        if (status === 'running') {
+          playerRef.current?.stopAll();
+          setListening(false);
+          cb.current.onAsrPartial?.('');
+        }
+        const message = status === 'completed'
+          ? (command === '/clear' ? '上下文已清空' : '上下文已压缩')
+          : status === 'failed' ? `${command} 失败：${String(ev.message ?? '')}`
+          : `${command} 执行中`;
+        cb.current.onMemoryNotice?.(message);
+        break;
+      }
       case 'memory.notice': {
         if (typeof ev.message === 'string') cb.current.onMemoryNotice?.(ev.message);
         break;
@@ -406,8 +426,10 @@ export function useSession(callbacks: UseSessionCallbacks) {
 
   const connect = useCallback(
     async ({ stream, videoEl, config, initialClock }: ConnectOptions) => {
-      if (activeRef.current) return;
+      if (activeRef.current) return false;
       activeRef.current = true;
+      const generation = ++connectGenerationRef.current;
+      const isCurrent = () => activeRef.current && connectGenerationRef.current === generation;
       setConnecting(true);
       setError(null);
       captureModeRef.current = config.captureMode;
@@ -426,12 +448,17 @@ export function useSession(callbacks: UseSessionCallbacks) {
           throw new Error(body.detail || `session create failed (HTTP ${res.status})`);
         }
         const body = (await res.json()) as { session_id: string; ws_url: string };
+        if (!isCurrent()) {
+          void fetch(resolveApiUrl(`/api/sessions/${body.session_id}`), { method: 'DELETE', keepalive: true }).catch(() => undefined);
+          return false;
+        }
         sessionIdRef.current = body.session_id;
 
         playerRef.current = new PcmPlayer();
         const socket = new SessionSocket(toWsUrl(resolveApiUrl(body.ws_url)), {
-          onEvent: handleEvent,
+          onEvent: (event) => { if (isCurrent()) handleEvent(event); },
           onAudio: (pcm, descriptor) => {
+            if (!isCurrent()) return;
             playerRef.current?.playChunk(
               String(descriptor.response_id),
               pcm,
@@ -439,15 +466,11 @@ export function useSession(callbacks: UseSessionCallbacks) {
               Number(descriptor.channels) || 1,
             );
           },
-          onStateChange: handleSocketState,
+          onStateChange: (state) => { if (isCurrent()) handleSocketState(state); },
         });
         socketRef.current = socket;
         socket.connect();
 
-        if (stream && stream.getAudioTracks().length > 0) {
-          micRef.current = await startMicCapture(stream, (pcm) => socketRef.current?.sendMic(pcm));
-          updateMicGate();
-        }
         if (videoEl) {
           // operator-set frames/sec (streaming model param) → falls back to the
           // 1 fps default; guarded to a sane floor so the sampler never stalls.
@@ -463,6 +486,27 @@ export function useSession(callbacks: UseSessionCallbacks) {
             { fps: frameFps, shouldSend: uplinkOk, clock: initialClock ?? 'live' },
           );
         }
+        if (stream && stream.getAudioTracks().length > 0) {
+          const abort = new AbortController();
+          micSetupAbortRef.current = abort;
+          try {
+            const mic = await startMicCapture(stream, (pcm) => {
+              if (isCurrent()) socket.sendMic(pcm);
+            }, { signal: abort.signal });
+            if (!isCurrent()) {
+              await mic.stop();
+              return false;
+            }
+            micRef.current = mic;
+            updateMicGate();
+          } catch (error) {
+            if (!isCurrent()) return false;
+            cb.current.onLog(`Microphone unavailable; video/text remain connected: ${String(error)}`, 'red');
+          } finally {
+            if (micSetupAbortRef.current === abort) micSetupAbortRef.current = null;
+          }
+        }
+        if (!isCurrent()) return false;
         reportTimerRef.current = setInterval(() => {
           const player = playerRef.current;
           if (player) {
@@ -471,7 +515,9 @@ export function useSession(callbacks: UseSessionCallbacks) {
             });
           }
         }, PLAYBACK_REPORT_MS);
+        return true;
       } catch (exc) {
+        if (!isCurrent()) return false;
         teardown(true);
         const message = exc instanceof Error ? exc.message : String(exc);
         setError(message);

@@ -2226,7 +2226,7 @@ export default function App() {
         }
       }
       try {
-        await session.connect({
+        const attached = await session.connect({
           stream: localStreamRef.current,
           videoEl: localVideoRef.current,
           config: {
@@ -2246,6 +2246,7 @@ export default function App() {
           },
           initialClock: mediaFile?.kind === 'video' ? 'media' : 'live', // a still image sits on the live clock
         });
+        if (!attached) return;
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         if (!hadPreview) stopWebMedia(); // keep a user-opened preview alive
@@ -3380,7 +3381,11 @@ export default function App() {
         isTyping: false,
         isStreaming: false,
         halo: false,
-        text: (language === 'en'
+        text: /offline chat not supported/i.test(message)
+          ? (language === 'en'
+            ? 'Offline chat is not enabled for this deployment. Switch to video-call mode.'
+            : '当前部署未启用离线聊天，请切换到实时通话。')
+          : (language === 'en'
           ? '⚠ The local model backend is unreachable — is the server running with a loaded checkpoint? '
           : '⚠ 本地模型后端暂不可用 — 请确认服务已启动并加载了模型。') + `(${message})`,
       } : m)));

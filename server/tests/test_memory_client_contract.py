@@ -81,7 +81,7 @@ def test_retained_correction_is_verified_before_context_dedup(tmp_path):
         session._pi = SimpleNamespace(reachable=lambda: True,
             decide=lambda *args: {'retrieve': True, 'query': '编号', 'reason': 'test'}, select=select)
         result = session.recall_for_turn('现在的编号是什么')
-        assert not result and result.reason is None, 'already-present evidence is not missing evidence'
+        assert not result and result.reason == 'context_present', 'already-present evidence is not missing evidence'
         assert called, 'normal hybrid path must also verify evidence'
     finally:
         session.close()

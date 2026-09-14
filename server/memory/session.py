@@ -20,11 +20,14 @@ worker's exact text-token count when the orchestrator plumbs it through, else
 an internal running estimate of noted turns + injected blocks.
 """
 from __future__ import annotations
+import hashlib
+from collections import OrderedDict
 
 import asyncio
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from itertools import islice
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from ..config import Settings
@@ -87,6 +90,8 @@ class _InjectedEntry:
     """Per-item re-injection bookkeeping, in TEXT-KV TOKEN positions."""
     copies: int = 0          # times injected this session (cap: memory_reinject_max_copies)
     last_tokens: float = 0.0  # session text-token position when last shown
+    full: bool = True
+    covered: Set[bytes] = field(default_factory=set)
 
 
 class MemorySession:
@@ -105,7 +110,7 @@ class MemorySession:
         self.lang_state = lang_mod.LanguageState(default=default_lang)
         self._t0 = time.monotonic()
         self._injected: Dict[int, _InjectedEntry] = {}
-        self._native_context: Set[Tuple[str, str]] = set()
+        self._native_context = OrderedDict()
         self._suppressed: Set[int] = set()
         self._last_frame_at = 0.0
         self._prefetch: Optional[Tuple[str, List[Candidate]]] = None
@@ -128,6 +133,8 @@ class MemorySession:
         self._lifetime_tokens = 0.0
         # estimate of the last formatted block, committed by mark_injected
         self._pending_block_tokens = 0
+        self._pending_injection_bodies = {}
+        self._distance_reason = None
         self.stats = {"recalls": 0, "injected": 0, "gated_out": 0}
 
     # ---- clock ----
@@ -159,7 +166,7 @@ class MemorySession:
 
     @while_open()
     def note_assistant_turn(self, text: str, *, media_ts: Optional[float] = None,
-                            commit: bool = True) -> None:
+                            commit: bool = True, historical_answer: bool = False) -> None:
         text = (text or "").strip()
         if not text:
             return
@@ -169,13 +176,17 @@ class MemorySession:
             # stays available as compact-journal context (uncommitted_turns),
             # but a half-finished answer must never enter long-term memory
             with self._lock:
-                self._uncommitted.append(("assistant", text))
+                if sum(len(t.encode()) for _, t in self._uncommitted) + len(text.encode()) <= max(1, self.settings.memory_uncommitted_bytes):
+                    self._uncommitted.append(("assistant", text))
+                else:
+                    self.stats['uncommitted_rejected'] = self.stats.get('uncommitted_rejected', 0) + 1
+                    log.warning('memory interrupted-history buffer full session=%s', self.conversation_id)
             return
         self.writer.note_utterance(
             self.conversation_id, "assistant", text,
             lang=lang_mod.detect_lang(text, default=self.language),
             session_ts=self.session_ts(), media_ts=media_ts, importance=0.4,
-            lifetime=self.lifetime)
+            lifetime=self.lifetime, historical_answer=historical_answer)
 
     def uncommitted_turns(self) -> List[Tuple[str, str]]:
         """(role, text) interrupted turns kept as compact context only."""
@@ -296,12 +307,14 @@ class MemorySession:
             self._est_tokens = max(self._est_tokens, float(now_tokens))
         self._pending_block_tokens = 0
         try:
+            self._pending_injection_bodies.clear()
             decision_started = time.monotonic()
             search_q, window = self._prepare_query(query)
             mode = (self.settings.memory_decision_mode or "vector").strip().lower()
             # Explicit history requests need query resolution BEFORE score gating.
             # Keep final evidence admission and KV de-duplication below unchanged.
-            decision_first = mode == "llm" or (mode == "hybrid" and has_past_reference(query))
+            decision_first = mode == "llm" or (mode == "hybrid" and
+                (has_past_reference(query) or rewrite_mod.temporal_order(query) is not None))
             if decision_first:
                 # pi /decide gates the whole turn; a retrieve=false verdict
                 # skips recall, a query rewrite overrides the search query
@@ -318,6 +331,11 @@ class MemorySession:
             log.info("memory recall session=%s stage=search rewritten=%s candidates=%s",
                      self.conversation_id, search_q != query,
                      [(c.item.id, c.space, round(c.raw, 3)) for c in candidates])
+            log.info('memory recall session=%s stage=candidate_meta items=%s', self.conversation_id,
+                     [(c.item.id, c.item.session_ts, c.item.kind, len(c.item.text)) for c in candidates])
+            order = rewrite_mod.temporal_order(query)
+            if order and mode in ('hybrid', 'llm'):
+                return self._recall_temporal(query, order, decision_started)
             if not candidates:
                 return EMPTY_RECALL
             if mode == "hybrid" and not decision_first and not self._hybrid_decide(query, candidates):
@@ -333,6 +351,8 @@ class MemorySession:
             # diversify/gate read the RAW query — the augmentation is search-only
             diverse = self.retriever.diversify(candidates, query, limit=limit)
             keep = self.retriever.gate(query, diverse)
+            log.info('memory recall session=%s stage=local_admission diverse=%s accepted=%s',
+                     self.conversation_id, [c.item.id for c in diverse], [c.item.id for c in keep])
             verified_empty = False
             if mode == 'hybrid':
                 # Already-present context is evidence too; it must be examined
@@ -343,7 +363,9 @@ class MemorySession:
                 for item in contextual:
                     if len(keep) >= 16:
                         break
-                    if item.id not in seen and ((item.role, item.text.strip()) in self._native_context or item.id in self._injected):
+                    if item.conversation_id != self.conversation_id:
+                        continue
+                    if item.id not in seen and (self._context_key(item.role, item.text) in self._native_context or item.id in self._injected):
                         keep.append(Candidate(item, relevance=0.0))
                         seen.add(item.id)
             if mode == "hybrid" and keep and self._pi is not None and self._pi.reachable():
@@ -370,13 +392,60 @@ class MemorySession:
             self.stats["recalls"] += 1
             if not keep:
                 self.stats["gated_out"] += 1
-                return RecallResult('', [], [], reason='no_evidence') if verified_empty else EMPTY_RECALL
+                return RecallResult('', [], [], reason='candidate_miss' if verified_empty else self._distance_reason)
             result = self._format(keep)
             log.info("memory recall session=%s stage=format ids=%s", self.conversation_id, result.ids)
             return result
         except Exception as exc:  # noqa: BLE001 — memory never breaks a turn
             log.warning("memory recall failed: %s", exc)
             return EMPTY_RECALL
+
+    def _recall_temporal(self, query, order, started):
+        items, complete = self.store.timeline(self.conversation_id, latest=order == 'latest',
+            limit=max(1, self.settings.memory_temporal_scan_items),
+            max_bytes=max(1, self.settings.memory_temporal_scan_bytes))
+        log.info('memory recall session=%s stage=temporal order=%s rows=%d complete=%s',
+                 self.conversation_id, order, len(items), complete)
+        if self._pi is None or not self._pi.reachable():
+            return RecallResult('', [], [], reason='selector_unavailable')
+        def spans():
+            serial = 1
+            for item in items:
+                if item.id in self._suppressed:
+                    continue
+                chunks = inject_mod.verbatim_chunks(item.text, self.settings.memory_inject_max_tokens-12)
+                if order == 'latest':
+                    chunks.reverse()
+                for text in chunks:
+                    candidate_id = serial
+                    serial += 1
+                    yield candidate_id, replace(item, text=text)
+        pending = spans()
+        offset = 0
+        while True:
+            batch = list(islice(pending, 16))
+            if not batch:
+                break
+            remaining = self.settings.memory_pi_decide_timeout_s - (time.monotonic() - started)
+            if remaining <= 0:
+                return RecallResult('', [], [], reason='temporal_budget')
+            selected = self._pi.select(query, [dict(id=key, role=i.role, session_ts=i.session_ts,
+                text=i.text) for key, i in batch], timeout_s=remaining, recent_turns='')
+            log.info('memory recall session=%s stage=temporal_evidence offset=%d ids=%s selected=%s',
+                     self.conversation_id, offset, [(key,i.id,len(i.text)) for key,i in batch], selected)
+            if selected is None:
+                return RecallResult('', [], [], reason='selector_failed')
+            # Stop at the first related record in the requested temporal order,
+            # before KV de-duplication can promote a later/earlier occurrence.
+            chosen = next((i for key,i in batch if key in selected), None)
+            if chosen is not None:
+                keep = self._distance_gate([Candidate(chosen, relevance=1.0)], self._est_tokens)
+                self.stats['recalls'] += 1
+                if not keep:
+                    return RecallResult('', [], [], reason=self._distance_reason or 'context_present')
+                return self._format(keep, shorten=False)
+            offset += len(batch)
+        return RecallResult('', [], [], reason='candidate_miss' if complete else 'temporal_budget')
 
     def _candidates(self, query: str) -> List[Candidate]:
         with self._lock:
@@ -422,31 +491,45 @@ class MemorySession:
         max_copies = max(1, int(self.settings.memory_reinject_max_copies))
         distance = max(0, int(self.settings.memory_reinject_distance))
         out: List[Candidate] = []
+        self._distance_reason = None
+        originals = self.store.get_items([c.item.id for c in candidates])
         for cand in candidates:
-            if (cand.item.role, (cand.item.text or '').strip()) in self._native_context:
+            original = originals.get(cand.item.id, cand.item)
+            if self._context_key(original.role, original.text) in self._native_context:
+                self._distance_reason = 'context_present'
                 continue
             entry = self._injected.get(cand.item.id)
             if entry is None:
                 out.append(cand)
                 continue
             if entry.copies >= max_copies:
+                self._distance_reason = 'copy_budget'
+                continue
+            if not entry.full and self._body_key(cand.item.text) not in entry.covered:
+                out.append(cand)
                 continue
             if (now_tokens - entry.last_tokens) < distance:
+                self._distance_reason = 'context_present'
                 continue
             out.append(cand)
         return out
 
-    def _format(self, keep: Sequence[Candidate]) -> RecallResult:
+    def _format(self, keep: Sequence[Candidate], *, shorten=True) -> RecallResult:
         """Chronological by ORIGINAL time, under a hard token budget."""
         ordered = sorted(keep, key=lambda c: (c.item.session_ts or 0.0))
         budget = max(0, int(self.settings.memory_inject_max_tokens))
+        budget = min(budget, max(0, int(self.settings.memory_inject_session_max_tokens-self._lifetime_tokens)))
+        budget = max(0, budget - inject_mod.estimate_tokens(inject_mod.build_recall_block([''])))
         lines: List[str] = []
         items: List[Dict[str, Any]] = []
         ids: List[int] = []
         frames: List[bytes] = []
         used = 0
+        originals = self.store.get_items([c.item.id for c in ordered])
         for cand in ordered:
             item = cand.item
+            if item.conversation_id != self.conversation_id:
+                continue
             is_frame = item.kind == KIND_FRAME
             jpeg = None
             if is_frame and not item.text:
@@ -460,7 +543,7 @@ class MemorySession:
             # re-injects ride the SHORT form (design §5): the first clause of
             # the verbatim text, not a byte-repeat of the whole turn
             entry = self._injected.get(item.id)
-            if entry is not None and entry.copies >= 1 and item.text:
+            if shorten and entry is not None and entry.full and entry.copies >= 1 and item.text:
                 body = inject_mod.first_clause(item.text)
             else:
                 body = item.text or ("画面" if self.language.startswith("zh") else "camera view")
@@ -471,12 +554,13 @@ class MemorySession:
             lines.append(line)
             used += cost
             ids.append(item.id)
+            self._pending_injection_bodies[item.id] = body
             if jpeg is not None:
                 frames.append(jpeg)
-            items.append({"id": item.id, "text": item.text, "session_ts": item.session_ts,
+            items.append({"id": item.id, "text": originals.get(item.id, item).text, "session_ts": item.session_ts,
                           "kind": item.kind, "media": item.media_hash, "score": round(cand.score, 4)})
         if not lines:
-            return EMPTY_RECALL
+            return RecallResult('', [], [], reason='injection_budget')
         block = inject_mod.build_recall_block(lines)
         self._pending_block_tokens = inject_mod.estimate_tokens(block)
         return RecallResult(block=block, items=items, ids=ids, frames=frames)
@@ -503,7 +587,8 @@ class MemorySession:
             return None
 
     @while_open()
-    def mark_injected(self, ids: Sequence[int], *, text_tokens: Optional[float] = None) -> None:
+    def mark_injected(self, ids: Sequence[int], *, text_tokens: Optional[float] = None,
+                      block: Optional[str] = None) -> None:
         """Commit an injected block: bump each item's copy count, stamp the
         text-KV position it was shown at, and fold the block's estimated tokens
         into the lifetime budget and the position estimate.
@@ -511,8 +596,14 @@ class MemorySession:
         `text_tokens` is the worker's exact session text-token count when the
         orchestrator plumbs it through; otherwise the internal estimate."""
         pos = float(text_tokens) if text_tokens is not None else self._est_tokens
+        owned = self.store.get_items(list(ids))
+        ids = [i for i in ids if int(i) in owned and owned[int(i)].conversation_id == self.conversation_id]
         for item_id in ids:
-            entry = self._injected.setdefault(int(item_id), _InjectedEntry())
+            entry = self._injected.setdefault(int(item_id), _InjectedEntry(full=False))
+            body = self._pending_injection_bodies.pop(item_id, None)
+            entry.full = entry.full or body is None or self._body_key(body) == self._body_key(owned[int(item_id)].text)
+            if body is not None:
+                entry.covered.add(self._body_key(body))
             entry.copies += 1
             entry.last_tokens = pos
             try:
@@ -520,7 +611,7 @@ class MemorySession:
             except Exception:  # noqa: BLE001
                 pass
         if ids:
-            block_tokens = float(self._pending_block_tokens)
+            block_tokens = float(inject_mod.estimate_tokens(block) if block is not None else self._pending_block_tokens)
             self._pending_block_tokens = 0
             self._lifetime_tokens += block_tokens
             # the block itself occupies KV from here on — keep the estimate monotone
@@ -531,7 +622,19 @@ class MemorySession:
     def note_context_turn(self, role: str, text: str) -> None:
         """Called only after model input acknowledgement or completed output."""
         if text and text.strip():
-            self._native_context.add((role, text.strip()))
+            key = self._context_key(role, text)
+            self._native_context[key] = None
+            self._native_context.move_to_end(key)
+            while len(self._native_context) > max(1, self.settings.memory_session_max_items):
+                self._native_context.popitem(last=False)
+
+    @staticmethod
+    def _context_key(role, text):
+        return hashlib.sha256((str(role)+'\0'+(text or '').strip()).encode()).digest()
+
+    @staticmethod
+    def _body_key(text):
+        return hashlib.sha256(inject_mod.sanitize_model_text(text).replace('\n', ' ').strip().encode()).digest()
 
     @while_open()
     def note_rollover(self, kept_item_ids: Sequence[int], *, text_tokens: float = 0.0) -> None:
@@ -630,6 +733,14 @@ class MemorySession:
         return bool(self._native_context or self._injected or self._uncommitted or
                     self.store.recent(self.conversation_id, [KIND_UTTERANCE], limit=1))
 
+    def cleared_copy(self) -> "MemorySession":
+        """Drain the old lifetime before reusing this conversation's storage key."""
+        self.close()
+        fresh = MemorySession(self.conversation_id, self.settings, self.store, self.writer,
+                              default_lang=self.language, facts=self._facts)
+        fresh._t0 = self._t0  # video timestamps still use the original session clock
+        return fresh
+
     def close(self) -> None:
         self.lifetime.seal()
         with self._close_lock:
@@ -644,11 +755,14 @@ class MemorySession:
                 self._injected.clear()
                 self._native_context.clear()
                 self._suppressed.clear()
+                self._pending_injection_bodies.clear()
             count = self.store.delete_session(self.conversation_id)
             self._cleaned = True
             log.info("memory session cleaned: %s (%d items)", self.conversation_id, count)
 
     def status(self) -> Dict[str, Any]:
         return {"items": self.store.count(self.conversation_id),
+                "resources": self.store.resource_status(self.conversation_id),
+                "writer_budget_rejected": self.writer.stats.get('budget_rejected', 0),
                 "injected_tokens": int(self._lifetime_tokens),
                 "lang": self.language, **self.stats}

@@ -21,9 +21,11 @@ class MemoryMaintenance:
                 cleaned += 1
             except Exception:
                 log.exception('memory cleanup pending: %s', session_id)
+        if self.store.frames is not None:
+            self.store.frames.refresh_usage()
+        self.store.reclaim_space()
         status = self.store.refresh_storage_status()
         if cleaned:
-            self.store.reclaim_space()
             log.info('memory maintenance cleaned %d session(s)', cleaned)
         return {'cleaned_sessions': cleaned, **status}
 

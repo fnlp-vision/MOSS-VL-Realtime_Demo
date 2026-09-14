@@ -8,6 +8,12 @@ Memory is scoped to the active session: reconnects within the grace period retai
 it; final session closure deletes retrieval records, vectors and temporary frames.
 Saved conversation archives have a separate lifecycle.
 
+Temporal recall handles first/last events using chronological candidates; a
+bounded retrieval miss does not suppress the model's existing context. Memory
+data, vector caches, pending payloads and temporary frames have separate budgets.
+Overload is reported; archive deletion remains opt-in. See [memory and retention
+operations](./server/README.md#resource-budgets) for limits and maintenance commands.
+
 ## Related Projects
 
 | Project | Role |
@@ -55,6 +61,22 @@ Open **http://localhost:18502**, switch to video-call mode, choose a media sourc
 ```
 
 Wait for model loading and kernel compilation on first startup. Use `--base-port 19500` to move the port group; the browser port becomes `19502`.
+
+## Context Commands
+
+In a realtime session, send `/compact` or `/clear` as the entire text message.
+Both commands interrupt generation and speech; inputs received while running
+are not submitted to the model. Wait for completion before continuing.
+
+- `/compact`: generate a summary and rebuild context, keeping session Memory
+  and recent turns. Requires Memory and a configured summary service (normally
+  pi_agent). Summary failure reports an error without replacing the context.
+- `/clear`: discard model context, summaries, session retrieval Memory, and
+  pending work. Preserve system instructions, connection/voice settings and
+  chat archives; resume with newly received frames. No summary service needed.
+
+These commands require backend session recreation support. They reduce or reset
+context; they do not guarantee correction of visual hallucinations.
 
 ## Configuration
 
@@ -154,6 +176,8 @@ npm run build
 ```
 
 The test runner supports both script-based suites and pytest. Use it rather than collecting every suite with a single pytest invocation.
+
+After building the frontend and installing Playwright's Chromium, run browser recovery checks with `node scripts/tests/realtime_recovery.cjs`. These checks use simulated media and a mocked backend.
 
 ## License
 

@@ -97,6 +97,8 @@ class Runtime:
         if getattr(self, 'memory_maintenance', None) is not None:
             self.memory_store.open()  # fail ownership checks before opening any archive writers
         if self.index is not None:
+            from .persistence.retention import acquire_archive_lock
+            self._archive_guard = acquire_archive_lock(self.index.db_path)
             self.index.open()
         if self.media is not None:
             self.media.open()
@@ -126,6 +128,10 @@ class Runtime:
             self.history.close()  # flush the writer queue first
         if self.index is not None:
             self.index.close()
+        guard = getattr(self, '_archive_guard', None)
+        if guard is not None:
+            guard.close()
+            self._archive_guard = None
 
     def start_voice(self) -> None:
         self.asr.start()
