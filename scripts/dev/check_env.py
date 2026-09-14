@@ -49,6 +49,7 @@ DIRECT_READERS = [
 SHELL_ONLY = {
     "WEB_PORT": "vite preview port (the ONE port to expose; default 20941)",
     "PORT": "backend api port (loopback only; default 8000)",
+    "PI_PORT": "local pi-agent port; MEMORY_PI_URL defaults to this port (default 38082)",
     "LOG_ROOT": "in-repo log tree root (default <repo>/logs)",
     "PYBIN": "API/rotating_tee interpreter (default <repo>/.venv/bin/python)",
     "FFMPEG_LIBS": "vendored FFmpeg .so dir for torchcodec (default <repo>/.venv/lib/ffmpeg)",
@@ -64,7 +65,7 @@ SHELL_ONLY = {
     "WS_PING_TIMEOUT": "WebSocket ping timeout in seconds (default 20)",
     "WATCH_POLL": "1 = polling vite build watcher (load-bearing on shared FS)",
     "WEB_NVM_NODE": "machine-dependent nvm version/alias for the web window (run_web.sh); set on boxes whose system Node is too old for Vite (Blackwell: 22); unset = no-op",
-    "VITE_BACKEND_ORIGIN": "vite dev/preview /api proxy target (default http://127.0.0.1:8000)",
+    "VITE_BACKEND_ORIGIN": "explicit vite /api proxy URL; otherwise derived from PORT (default http://127.0.0.1:8000)",
     "GPU": "standalone worker: CUDA_VISIBLE_DEVICES value",
     "WORKER_ID": "standalone worker: worker id",
     "ENV_DEPLOY_FILE": "path override for THIS file; empty string disables layer 3",

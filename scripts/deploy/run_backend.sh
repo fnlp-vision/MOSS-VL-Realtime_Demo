@@ -20,6 +20,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # ---- .env.deploy (config layer 3; box-local, gitignored) ----
 . "$REPO/scripts/deploy/env_lib.sh"
 load_env_deploy "$REPO"
+resolve_service_endpoints
 
 # torchcodec dlopens the FFmpeg shared libs (libavutil & co), which fresh pods
 # don't ship (apt state dies with the container). They are vendored INSIDE the

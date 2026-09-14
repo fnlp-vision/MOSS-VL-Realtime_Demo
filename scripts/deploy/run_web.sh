@@ -14,6 +14,8 @@ cd "$REPO"
 # standalone runs; caller env (layers 1-2) wins
 . "$REPO/scripts/deploy/env_lib.sh"
 load_env_deploy "$REPO"
+resolve_service_endpoints
+echo "[web] /api proxy: $VITE_BACKEND_ORIGIN"
 
 BUILD_LOG="${BUILD_LOG:-$REPO/logs/stdout/web/build.log}"
 PYBIN="${PYBIN:-$REPO/.venv/bin/python}"

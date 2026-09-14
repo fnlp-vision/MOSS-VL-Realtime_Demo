@@ -15,6 +15,21 @@
 
 ENV_DEPLOY_KEYS=()
 
+# Resolve local companion addresses after configuration is loaded. Explicit
+# URLs may point to another machine and must never be rewritten from a port.
+resolve_service_endpoints() {
+  export VITE_BACKEND_ORIGIN="${VITE_BACKEND_ORIGIN:-http://127.0.0.1:${PORT:-8000}}"
+  export PI_PORT="${PI_PORT:-38082}"
+  export MEMORY_PI_URL="${MEMORY_PI_URL-http://127.0.0.1:$PI_PORT}"
+  case "$VITE_BACKEND_ORIGIN" in
+    http://127.0.0.1:*|http://localhost:*)
+      if [ "$VITE_BACKEND_ORIGIN" != "http://127.0.0.1:${PORT:-8000}" ] &&
+         [ "$VITE_BACKEND_ORIGIN" != "http://localhost:${PORT:-8000}" ]; then
+        echo "[config] explicit VITE_BACKEND_ORIGIN=$VITE_BACKEND_ORIGIN differs from local API port ${PORT:-8000}; preserved. Unset it to follow PORT." >&2
+      fi ;;
+  esac
+}
+
 load_env_deploy() {
   local f
   if [ "${ENV_DEPLOY_FILE+x}" = "x" ]; then

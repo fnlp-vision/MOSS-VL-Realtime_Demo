@@ -64,6 +64,10 @@ def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def _default_memory_pi_url() -> str:
+    return f"http://127.0.0.1:{_env('PI_PORT') or '38082'}"
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
@@ -791,7 +795,7 @@ class Settings:
     # retrieval (/decide) and compacts the rollover journal (/compact). An
     # unreachable or failing pi degrades every dependent path to the
     # local-vector / verbatim-tail behavior — never a broken turn.
-    memory_pi_url: str = field(default_factory=lambda: _env("MEMORY_PI_URL", "http://127.0.0.1:38082"))
+    memory_pi_url: str = field(default_factory=lambda: _env("MEMORY_PI_URL", _default_memory_pi_url()))
     memory_pi_decide_timeout_s: float = field(
         default_factory=lambda: _env_float("MEMORY_PI_DECIDE_TIMEOUT_S", 8.0))
     memory_pi_compact_timeout_s: float = field(

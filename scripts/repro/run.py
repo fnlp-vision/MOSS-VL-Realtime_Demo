@@ -189,6 +189,13 @@ def up(args):
             except OSError: time.sleep(1)
         else: raise TimeoutError("web did not start")
         print(f"Ready: http://localhost:{ports['web']} (remote cameras require HTTPS)", flush=True)
+        print(f"API: http://127.0.0.1:{ports['api']} | native backend: http://127.0.0.1:{ports['backend']}", flush=True)
+        print(f"curl --fail http://127.0.0.1:{ports['api']}/api/status", flush=True)
+        print(f"curl --fail http://127.0.0.1:{ports['api']}/v1/realtime/health", flush=True)
+        if 'memory' in profiles:
+            print(f"Memory pi: http://127.0.0.1:{ports['pi']}", flush=True)
+        if 'tts' in profiles:
+            print(f"TTS: http://127.0.0.1:{ports['tts']}", flush=True)
     except BaseException:
         stop(records)
         STATE.unlink(missing_ok=True)

@@ -38,7 +38,7 @@ Node 内置 `http`/`fs`/`fetch`，不新增 npm 依赖。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `PI_PORT` | `38080` | 监听端口（固定绑定 127.0.0.1） |
+| `PI_PORT` | `38082` | 监听端口（固定绑定 127.0.0.1）；Demo 默认地址随此变量变化 |
 | `PI_AGENT_MODE` | `hop` | `/decide` 模式：`hop` 单次调用；`agent` 完整 agent loop |
 | `BOARD_MEMORY_URL` | `http://127.0.0.1:8081` | board 记忆服务地址（agent 模式工具回调用） |
 | `AIGW_BASE_URL` | `http://127.0.0.1:38090/v1` | SGLang-compatible base URL |
@@ -68,12 +68,19 @@ export AIGW_DECIDE_MODEL=Qwen3-4B-Instruct-2507
 export AIGW_COMPACT_MODEL=Qwen3-4B-Instruct-2507
 export AIGW_LOCAL_NO_REASONING=1
 export AIGW_AUTH_MODE=local
-npm start                 # = node service.mjs（默认 hop 模式，127.0.0.1:38080）
+npm start                 # = node service.mjs（默认 hop 模式，127.0.0.1:38082）
 
 PI_AGENT_MODE=agent npm start          # agent 模式（需要 board memory 在线）
 ```
 
 ## 契约示例
+
+独立启动默认端口已与 Demo 对齐为 38082（旧版独立服务默认为 38080）。
+手动改端口时，在 pi-agent 和 Demo 的启动环境中使用同一个 `PI_PORT`；
+`scripts/gpu/start_pi_agent.sh` 与 Demo 启动器都会读取 `.env.deploy`。
+直接执行 `npm start` 不读取该文件，需要在当前 shell 导出 `PI_PORT`。
+如果 Demo 显式设置了 `MEMORY_PI_URL`，该 URL 优先；删除覆盖项才恢复按 `PI_PORT` 自动生成。
+推荐 `run.py` 托管部署使用独立的端口组（默认 pi-agent 18503），无需手动设置。
 
 Demo 的 `hybrid` 模式对明确的历史指代先调用 `/decide`，使用返回的实体属性检索词搜索，
 所有通过本地准入的 hybrid 候选均调用 `/select`，结合近期纠正核验证据，最后再进行上下文去重。
@@ -86,11 +93,11 @@ Demo 的 `hybrid` 模式对明确的历史指代先调用 `/decide`，使用返�
 
 ```bash
 # 健康检查
-curl -s http://127.0.0.1:38080/health
+curl -s http://127.0.0.1:38082/health
 # {"ok":true,"model":"Qwen3-4B-Instruct-2507","compact_model":"Qwen3-4B-Instruct-2507","mode":"hop"}
 
 # 决策
-curl -s http://127.0.0.1:38080/decide -H 'content-type: application/json' -d '{
+curl -s http://127.0.0.1:38082/decide -H 'content-type: application/json' -d '{
   "conversation_id": "cam-42",
   "recent_turns": "用户: 晚饭吃什么好？\n助手: 要不来点清淡的，比如粥。",
   "pending_user_text": "我之前给你看的那台相机是什么牌子？"
@@ -98,7 +105,7 @@ curl -s http://127.0.0.1:38080/decide -H 'content-type: application/json' -d '{
 # 200 {"retrieve":true,"query":"...","reason":"..."}
 
 # 压缩
-curl -s http://127.0.0.1:38080/compact -H 'content-type: application/json' -d '{
+curl -s http://127.0.0.1:38082/compact -H 'content-type: application/json' -d '{
   "conversation_id": "cam-42",
   "journal": "用户: ...\n助手: ...\n用户: ...",
   "summary_max_tokens": 200

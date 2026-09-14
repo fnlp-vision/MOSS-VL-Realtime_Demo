@@ -56,6 +56,7 @@ CMD="${CMD:-up}"
 # in the file are recorded so fwd_env can carry them into the tmux windows.
 . "$REPO/scripts/deploy/env_lib.sh"
 load_env_deploy "$REPO"
+resolve_service_endpoints
 SES="${DEMO_SESSION:-moss}"
 API_PORT="${PORT:-8000}"
 WEB_PORT="${WEB_PORT:-20941}"
@@ -247,6 +248,11 @@ up() {
   CURL "http://127.0.0.1:$WEB_PORT/" >/dev/null && echo "      web: up" \
     || echo "      web not answering yet — $LOG_ROOT/stdout/web/console.log"
   echo "UP — web :$WEB_PORT · api :$API_PORT · logs $LOG_ROOT/{handler,stdout} · '$0 status' any time"
+  echo "      browser: http://localhost:$WEB_PORT"
+  echo "      web /api proxy: $VITE_BACKEND_ORIGIN"
+  echo "      memory pi: $MEMORY_PI_URL (when enabled)"
+  echo "      curl --fail http://127.0.0.1:$API_PORT/api/status"
+  echo "      curl --fail http://127.0.0.1:$API_PORT/v1/realtime/health"
 }
 
 restart_one() { # $1 = api|web

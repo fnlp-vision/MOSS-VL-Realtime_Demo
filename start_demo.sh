@@ -23,6 +23,8 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$REPO/scripts/deploy/env_lib.sh"
+load_env_deploy "$REPO"
 WEB_PORT=${WEB_PORT:-20941}          # GPU 侧 web preview 端口
 CPU_PORT=${CPU_PORT:-$WEB_PORT}      # 暴露到 CPU 节点的端口（nat2 /proxy/<CPU_PORT>/）
 CPU_SSH=${CPU_SSH:-"ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@127.0.0.1"}
@@ -37,6 +39,7 @@ fi
 
 # ---- 部署布局配置（deploy.conf，env 优先）----
 [ -f "$REPO/deploy.conf" ] && . "$REPO/deploy.conf"
+resolve_service_endpoints
 
 GPUS=${OMNI_GPUS:-0,1}
 TP_SIZE=${OMNI_TP_SIZE:-1}
@@ -53,6 +56,7 @@ omni_urls=""
 for (( i=0; i<instances; i++ )); do
   omni_urls+="${omni_urls:+,}http://127.0.0.1:$((port_base + i))"
 done
+export SGLANG_OMNI_URLS="$omni_urls"
 if [ -f "$REPO/.env.deploy" ] && grep -q "^SGLANG_OMNI_URLS=" "$REPO/.env.deploy"; then
   sed -i "s|^SGLANG_OMNI_URLS=.*|SGLANG_OMNI_URLS=$omni_urls|" "$REPO/.env.deploy"
 else

@@ -124,6 +124,13 @@ curl --fail -X POST http://127.0.0.1:18501/v1/realtime/sessions
 The last command creates a thin-gateway session, not a Demo memory session;
 close it after use with `DELETE /v1/realtime/sessions/{session_id}`.
 Realtime frames and prompts use WebSocket, not a chat-completions curl request.
+Startup prints the actual browser/API addresses and health-check commands.
+For manual deployment, set `PORT` for the API and `PI_PORT` for pi-agent;
+the frontend proxy and `MEMORY_PI_URL` follow those ports automatically when
+their explicit URL overrides are unset. An existing `VITE_BACKEND_ORIGIN` or
+`MEMORY_PI_URL` remains authoritative; remove it to restore automatic linking.
+Standalone pi-agent and Demo both default to 38082. Recommended `run.py` deployment
+continues to derive every component's port and URL from `--base-port`.
 The backend's optional VL API v2 uses a separate listener (default 18610);
 it does not replace the Demo/native endpoint and has different response-completion
 semantics. Do not switch the Demo's backend URL to v2.

@@ -2,7 +2,10 @@
 # Reconcile the owned memory backend and pi-agent with the requested config.
 set -euo pipefail
 REPO=${MOSS_DEPLOY_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)}
+. "$REPO/scripts/deploy/env_lib.sh"
+load_env_deploy "$REPO"
 [ ! -f "$REPO/deploy.conf" ] || . "$REPO/deploy.conf"
+resolve_service_endpoints
 KEYS=(OMNI_ROOT PI_AGENT_DIR PI_AGENT_NODE PI_PORT START_4B FORCE_PI FORCE_4B LOG_DIR AIGW_AUTH_MODE
   DECIDE_LLM_MODEL DECIDE_LLM_GPU DECIDE_LLM_PORT DECIDE_LLM_MEM_FRAC
   DECIDE_LLM_CONTEXT_LENGTH DECIDE_LLM_MAX_RUNNING_REQUESTS DECIDE_LLM_MAX_TOTAL_TOKENS

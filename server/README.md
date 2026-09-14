@@ -48,7 +48,7 @@ Without `AUTOLOAD_VLM=1` the app boots with no model; load one later via
 `POST /api/models/load {model_path, gpu_id, hf_mode}` (legacy alias
 `/api/load_model`; refused with 409 while sessions are live).
 
-The TTS engine runs as a separate **sidecar/engine** on `http://127.0.0.1:18100+`
+For the manual/legacy entry below, TTS runs as a separate **sidecar/engine** on `http://127.0.0.1:18100+`
 (spawned + health-gated by the backend lifespan), or set `TTS_ENABLED=0`
 (sessions then stream captions without audio). `TTS_PROVIDER` picks the model
 (per-model adapters under `server/adapters/tts/`): `moss_tts_nano` (pytorch
@@ -56,6 +56,13 @@ sidecar) · `vllm_omni` (Nano on vLLM-Omni) · `cosyvoice3` /
 `moss_tts_realtime` (Fun-CosyVoice3-0.5B / MOSS-TTS-Realtime on vLLM-Omni,
 24 kHz mono) · `cosyvoice3_native` / `moss_tts_realtime_native` (vendored
 fallback stacks in `.venv-cosy` / `.venv-mossrt`).
+
+The recommended `scripts/repro/run.py` deployment instead uses TTS port 18505,
+API 18501 and browser 18502 by default; `--base-port` moves the whole group and
+updates companion URLs together. It does not read `.env.deploy`.
+For manual deployment, `PORT` drives the frontend proxy unless
+`VITE_BACKEND_ORIGIN` is explicitly set. `PI_PORT` drives the default
+`MEMORY_PI_URL`; standalone pi-agent and Demo both default to 38082.
 
 ## Online vs offline serving (two models, split GPU fleet)
 

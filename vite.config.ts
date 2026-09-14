@@ -42,7 +42,7 @@ const watchSentenceClips = (): Plugin => ({
 //      the path vite sees starts at /api. (backend_overhaul.md §8 decision 1)
 const apiProxy = {
   '/api': {
-    target: process.env.VITE_BACKEND_ORIGIN || 'http://127.0.0.1:8000',
+    target: process.env.VITE_BACKEND_ORIGIN || `http://127.0.0.1:${process.env.PORT || '8000'}`,
     changeOrigin: true,
     ws: true, // the session WebSocket rides this same rule
   },

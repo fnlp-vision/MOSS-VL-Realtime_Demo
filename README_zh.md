@@ -119,6 +119,12 @@ curl --fail -X POST http://127.0.0.1:18501/v1/realtime/sessions
 不是普通 chat-completions curl 请求。后端可选的 VL API v2 使用独立监听端口（默认 18610），
 不替换原有 Demo/native 接口，且回答结束事件语义不同；不要将 Demo 的后端 URL 切到 v2。
 
+启动时会打印实际浏览器/API 地址及健康检查命令。手动部署只需设置 API 的 `PORT`
+和 pi-agent 的 `PI_PORT`；未指定 URL 时，前端代理与 `MEMORY_PI_URL` 自动跟随。
+已有的 `VITE_BACKEND_ORIGIN` 或 `MEMORY_PI_URL` 显式配置仍优先，删除该覆盖项才恢复自动联动。
+独立 pi-agent 与 Demo 统一默认使用 38082；推荐的 `run.py` 继续通过 `--base-port`
+统一生成所有组件端口和 URL。
+
 服务默认绑定 loopback。公开部署必须补充鉴权、会话归属校验、TLS 和限流；一次性 WebSocket token 不等同于完整鉴权。
 
 ## 更多文档

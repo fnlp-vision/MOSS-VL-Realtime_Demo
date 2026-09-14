@@ -25,7 +25,7 @@ try {
   process.exit(1);
 }
 
-const PORT = Number(process.env.PI_PORT || 38080);
+const PORT = Number(process.env.PI_PORT || 38082);
 const HOST = "127.0.0.1";
 const MAX_BODY_BYTES = 1024 * 1024; // 1MB 足够覆盖 journal
 
@@ -166,4 +166,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`[pi_agent] listening on http://${HOST}:${PORT} mode=${mode()} model=${decideModelName()}`);
+  console.log(`[pi_agent] Demo endpoint: MEMORY_PI_URL=http://${HOST}:${PORT}`);
+  console.log(`[pi_agent] health: curl --fail http://${HOST}:${PORT}/health`);
 });
