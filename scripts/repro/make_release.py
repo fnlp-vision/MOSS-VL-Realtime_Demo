@@ -52,13 +52,15 @@ def main():
     parser.add_argument("--backend", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if not (args.backend / 'pyproject.toml').is_file():
+        raise RuntimeError('Backend source must contain pyproject.toml')
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary) / "moss-realtime-release"
         demo, backend = root / "demo", root / "backend"
         demo.mkdir(parents=True); backend.mkdir()
         export(ROOT, demo, ["README_zh.md", "bootstrap.sh", "services/pi_agent", "deployment/repro", "scripts/repro",
-            "docs/compatibility.md", "docs/manual_deployment.md", "docs/deployment_operations.md",
+            "docs/manual_deployment.md", "docs/deployment_operations.md",
             "scripts/deploy/stop_backend.py", "scripts/deploy/memory_backend.py", "server/tests/test_repro_install.py",
             "server/tests/test_memory_batch1.py", "server/tests/test_memory_batch2.py",
             "server/tests/test_memory_shutdown.py", "server/tests/test_deploy_shutdown.py"])

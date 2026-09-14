@@ -1,8 +1,17 @@
-# 部署与运维预案（GATEWAY_PLAN.md P8）
+# 部署运维与历史环境参考
+
+新安装以 [README](../README_zh.md) 的 `bootstrap.sh` / `scripts/repro/run.py` 为准：
+后端/API/网页为 18500/18501/18502，pi-agent/4B/TTS 为 18503/18504/18505。
+健康检查：`curl --fail http://127.0.0.1:18501/api/status`。
+该入口不读取 `.env.deploy`，不要求内部 SSH 转发或 MiniMax 凭据。
+
+下文是 `start_demo.sh` 的特定历史环境预案，包含 8100、20941、38082、38090 及内部转发。
+这些不是推荐安装的默认值，不可与推荐命令混用。8000 属于另行配置的手动部署示例。
+端口差异不是 HTTP 请求协议变更。可选 VL API v2 是另一个监听端口，不能替换 Demo 的 native 后端地址。
 
 > 面向运维/值班。依据：`GATEWAY_PLAN.md` §0 决策表与 P8 节、`start_demo.sh` / `stop_demo.sh` /
 > `deploy.conf`、`server/gateway/` 包、`docs/gateway_alerting.md`（告警规则，本文档引用，不重复定义）。
-> 所有端口/路径/键名均已对照代码核实；仍存疑处以「待确认」标出。
+> 使用历史环境前需按实际配置核对端口和路径；未确认项保留「待确认」。
 
 ## 1. 部署拓扑
 

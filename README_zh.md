@@ -4,6 +4,9 @@
 
 MOSS-VL 实时视频与语音交互应用，提供浏览器界面，以及可选语音识别、语音合成和长期记忆。
 
+Memory 是会话内长期记忆：宽限期内重连保留，最终结束会话后清理检索记录、向量和临时帧。
+已保存的聊天归档采用独立生命周期。
+
 ## 配套项目
 
 | 项目 | 职责 |
@@ -62,7 +65,37 @@ bash bootstrap.sh --backend-source ../backend --with-memory --with-asr --with-tt
 | 后端 / API / 网页 | 18500 / 18501 / 18502 |
 | pi-agent / 4B / TTS | 18503 / 18504 / 18505 |
 
-请按硬件调整显存和并发参数，详见[安装指南](./deployment/repro/README.md)和[兼容说明](./docs/compatibility.md)。
+请按硬件调整显存和并发参数，详见[安装指南](./deployment/repro/README.md)。
+
+## 兼容性与更新
+
+安装清单只标明仓库，不固定后端或模型提交。新安装获取后端默认分支及当前模型仓库；
+重跑安装沿用已安装版本，添加 `--update` 才显式更新后端和已启用模型。
+运行依赖仍单独锁定：Demo 使用 CPU 环境，后端使用自身仓库的依赖锁。
+
+| 环境 | 运行依赖 |
+| --- | --- |
+| Demo | Python 3.12；Torch 2.8.0 CPU；Transformers 4.57.1；Node 22.12.0 |
+| CUDA 后端 | Python 3.12；Torch 2.11.0；Transformers 5.12.1；SGLang 0.5.16；FlashInfer 0.6.14 |
+| CUDA 工具链 | 编译器/CRT/NVVM 13.0.88，配合 CUDA 13.0 运行库 |
+
+不要将原版 Transformers 4.57 自定义模型文件混入 SGLANG 权重目录。
+模型上下文 256K 不等于服务配置的 131072；ASR/TTS 和跨 context 记忆恢复由 Demo 提供。
+Ascend 使用后端独立的 NPU 安装说明，不安装本 CUDA 依赖锁。
+
+更新前停止托管服务，并先提交或保留本地修改；在仓库根目录执行：
+
+```bash
+.venv/bin/python scripts/repro/run.py down
+git pull --ff-only
+bash bootstrap.sh --update
+.venv/bin/python scripts/repro/run.py up --main-gpu 0 --memory-gpu 1
+.venv/bin/python scripts/repro/smoke.py
+```
+
+更新保留已启用组件，不覆盖后端本地修改。实际安装版本记录在
+`.repro/managed-install.json` 和 `.repro/models-verified.json`，用于排错，不约束下次更新。
+源码包使用随包后端，不自动从 Git 更新。旧模型快照保留，更新前应预留磁盘空间。
 
 ## 接口与部署
 
@@ -73,11 +106,24 @@ bash bootstrap.sh --backend-source ../backend --with-memory --with-asr --with-tt
 
 浏览器协议与底层模型协议不同。网页仅代理 `/api`；外部网关客户端访问 API 端口或显式配置 `/v1` 反向代理。浏览器与网关的实例池不共享全局准入计数。
 
+推荐安装的默认端口示例：
+
+```bash
+curl --fail http://127.0.0.1:18501/api/status
+curl --fail http://127.0.0.1:18501/v1/realtime/health
+curl --fail -X POST http://127.0.0.1:18501/v1/realtime/sessions
+```
+
+最后一条创建薄网关会话，不包含 Demo memory；使用后通过
+`DELETE /v1/realtime/sessions/{session_id}` 关闭。实时帧和问题使用 WebSocket，
+不是普通 chat-completions curl 请求。后端可选的 VL API v2 使用独立监听端口（默认 18610），
+不替换原有 Demo/native 接口，且回答结束事件语义不同；不要将 Demo 的后端 URL 切到 v2。
+
 服务默认绑定 loopback。公开部署必须补充鉴权、会话归属校验、TLS 和限流；一次性 WebSocket token 不等同于完整鉴权。
 
 ## 更多文档
 
-- [网关协议](./docs/gateway_contract.md)与[运维手册](./docs/ops_runbook.md)。
+- [网关协议](./docs/gateway_contract.md)与[运维及历史环境说明](./docs/ops_runbook.md)。
 - [Memory 服务](./services/pi_agent/README.md)与[容量规划](./docs/vlm_memory_capacity.md)。
 - [手工与历史部署](./docs/manual_deployment.md)、[部署运维](./docs/deployment_operations.md)。旧版 HF/NPU 环境与推荐配置分开使用。
 

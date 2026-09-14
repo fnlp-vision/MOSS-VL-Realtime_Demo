@@ -1,6 +1,6 @@
 # 手工接入与历史环境
 
-> 本页保留旧版手工配置与迁移参考，不是推荐 Quickstart。新环境从[主 README](../README_zh.md#快速开始)安装；不要将此处的 `22b671a` 历史组合与推荐环境混装。历史容量测量仍按原记录解释。
+> 本页是独立的手工配置入口，不是推荐 Quickstart。新环境从[主 README](../README_zh.md#快速开始)安装。本页示例 API 为 8000、网页为 20941；推荐安装为 18501/18502，不可混用。历史容量测量仍按原记录解释。
 
 ## 仓库与版本
 
@@ -13,7 +13,7 @@
 | TF 5.12.1 兼容模型 | [OpenMOSS-Team/MOSS-VL-Realtime-SGLANG](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime-SGLANG) | 与特化后端配套的 checkpoint、processor 和自定义代码；公开仓库 |
 | 原版模型 | [OpenMOSS-Team/MOSS-VL-Realtime](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime) | 原始权重及 Transformers 4.57 系列参考实现，供 HF 路径使用 |
 
-配套版本：后端 [`22b671a`](https://github.com/fnlp-vision/sglang-omni-realtime/commit/22b671a9e46d63eaf1f80bcd6ef1f0f043cf3f82)、TF 5.12.1 模型包 [`bcfd9cc`](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime-SGLANG/tree/bcfd9ccf1e9db2896ad852301cc8dde4a6349c78)、HF 参考模型 [`1e6a45b`](https://huggingface.co/OpenMOSS-Team/MOSS-VL-Realtime/commit/1e6a45b292eeaf02aa733bd3aa7b6c85214ddc86)。部署时请固定代码和模型 revision，并在发布清单中记录。
+使用上述命名仓库的当前代码和完整模型，不固定源码提交。依赖按对应仓库安装说明准备；实际部署版本可记录在运行日志或版本标签中，用于排错。
 
 ## 功能
 
@@ -78,7 +78,6 @@ source .venv/bin/activate
 uv pip install -e .
 
 hf download OpenMOSS-Team/MOSS-VL-Realtime-SGLANG \
-  --revision bcfd9ccf1e9db2896ad852301cc8dde4a6349c78 \
   --local-dir /path/to/moss-vl-realtime-sglang
 
 python examples/run_moss_vl_realtime_server.py \
@@ -132,7 +131,7 @@ SGLANG_OMNI_URLS=http://127.0.0.1:18500
 SGLANG_OMNI_SESSIONS_PER_REPLICA=1
 SGLANG_OMNI_CONTEXT_LENGTH=131072
 MODEL_PATH=/path/to/moss-vl-realtime-sglang
-GATEWAY_MODEL_VERSION=model-bcfd9cc_backend-22b671a
+GATEWAY_MODEL_VERSION=
 ```
 
 示例版本标识对应上面的固定版本；使用不同产物时应填写真实发布标识。`MODEL_PATH` 在该模式主要供 tokenizer/状态估算使用，不会在 Demo 中加载这份 5.12.1 模型。若两层不共享文件系统，应在 Demo 侧提供匹配的 tokenizer 文件。

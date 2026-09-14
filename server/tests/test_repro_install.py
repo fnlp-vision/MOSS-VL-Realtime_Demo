@@ -12,15 +12,15 @@ bootstrap = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bootstrap)
 
 
-def test_manifest_pins_all_sources():
+def test_manifest_names_sources_without_pinning_revisions():
     manifest = json.loads((ROOT / "deployment/repro/manifest.json").read_text())
-    assert len(manifest["backend"]["revision"]) == 40
+    assert 'revision' not in manifest['backend']
     assert manifest["backend"]["url"] == "https://github.com/fnlp-vision/sglang-omni-realtime.git"
     assert len(manifest["node"]["sha256"]) == 64
     for model in manifest["models"].values():
-        assert len(model["revision"]) == 40 and model["files"]
+        assert model['repo_id'] and 'revision' not in model and 'files' not in model
         assert not Path(model["directory"]).is_absolute()
-        assert all(".." not in Path(entry["path"]).parts for entry in model["files"])
+        assert '..' not in Path(model['directory']).parts
 
 
 def test_installation_environment_does_not_inherit_internal_indexes(tmp_path, monkeypatch):

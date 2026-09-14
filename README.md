@@ -4,6 +4,10 @@ English | [简体中文](./README_zh.md)
 
 A browser application for realtime video and voice interaction with MOSS-VL, with optional speech recognition, speech synthesis, and long-term memory.
 
+Memory is scoped to the active session: reconnects within the grace period retain
+it; final session closure deletes retrieval records, vectors and temporary frames.
+Saved conversation archives have a separate lifecycle.
+
 ## Related Projects
 
 | Project | Role |
@@ -62,7 +66,43 @@ Wait for model loading and kernel compilation on first startup. Use `--base-port
 | Backend / API / browser | 18500 / 18501 / 18502 |
 | pi-agent / 4B / TTS | 18503 / 18504 / 18505 |
 
-Adjust memory and concurrency for your hardware. See the [installation guide](./deployment/repro/README.md) and [compatibility notes](./docs/compatibility.md) (Chinese) for configuration details.
+Adjust memory and concurrency for your hardware. See the [installation guide](./deployment/repro/README.md).
+
+## Compatibility and Updates
+
+The source manifest names repositories, not fixed backend/model commits. New
+installs fetch the backend's default branch and current model repositories.
+Rerunning bootstrap resumes the installed versions; `--update` explicitly refreshes
+the backend and enabled models. Runtime dependency locks remain separate: Demo
+uses its CPU environment, while the backend installs its own dependency lock.
+
+| Environment | Runtime |
+| --- | --- |
+| Demo | Python 3.12; Torch 2.8.0 CPU; Transformers 4.57.1; Node 22.12.0 |
+| CUDA backend | Python 3.12; Torch 2.11.0; Transformers 5.12.1; SGLang 0.5.16; FlashInfer 0.6.14 |
+| CUDA toolkit | Compiler/CRT/NVVM 13.0.88 with CUDA 13.0 runtime |
+
+Do not mix the original Transformers 4.57 custom model files into the SGLANG
+checkpoint. Model context (256K) differs from configured service context (131072).
+ASR/TTS and cross-context memory rollover belong to the Demo, not the weights.
+Ascend uses the backend's separate NPU installation instructions, not these locks.
+
+Stop the managed deployment before updating; commit or preserve local changes
+before pulling. Run from this repository root:
+
+```bash
+.venv/bin/python scripts/repro/run.py down
+git pull --ff-only
+bash bootstrap.sh --update
+.venv/bin/python scripts/repro/run.py up --main-gpu 0 --memory-gpu 1
+.venv/bin/python scripts/repro/smoke.py
+```
+
+Enabled profiles are retained. Local backend edits are never overwritten.
+Actual installed revisions are recorded in `.repro/managed-install.json` and
+`.repro/models-verified.json` for diagnostics; these records do not pin future
+updates. Source bundles use the supplied backend and are not updated from Git.
+Previously downloaded snapshots are retained; budget disk space for updates.
 
 ## API and Deployment
 
@@ -73,11 +113,26 @@ External client -> gateway /v1/realtime -> backend /v1/video/realtime
 
 The browser and backend protocols are different. The web server proxies `/api` only; external gateway clients use the API port or an explicitly configured `/v1` reverse proxy. Browser and gateway pools do not share a global admission counter.
 
+For the recommended installation (default ports):
+
+```bash
+curl --fail http://127.0.0.1:18501/api/status
+curl --fail http://127.0.0.1:18501/v1/realtime/health
+curl --fail -X POST http://127.0.0.1:18501/v1/realtime/sessions
+```
+
+The last command creates a thin-gateway session, not a Demo memory session;
+close it after use with `DELETE /v1/realtime/sessions/{session_id}`.
+Realtime frames and prompts use WebSocket, not a chat-completions curl request.
+The backend's optional VL API v2 uses a separate listener (default 18610);
+it does not replace the Demo/native endpoint and has different response-completion
+semantics. Do not switch the Demo's backend URL to v2.
+
 Services bind to loopback by default. Public deployments must add authentication, session ownership checks, TLS, and rate limits. A one-time WebSocket token is not a complete authentication system.
 
 ## Documentation
 
-- [Gateway protocol](./docs/gateway_contract.md) and [operations](./docs/ops_runbook.md).
+- [Gateway protocol](./docs/gateway_contract.md) and [operations / legacy environment](./docs/ops_runbook.md).
 - [Memory service](./services/pi_agent/README.md) and [capacity planning](./docs/vlm_memory_capacity.md).
 - [Manual/legacy deployment](./docs/manual_deployment.md) and [deployment operations](./docs/deployment_operations.md). Keep legacy HF/NPU environments separate from the recommended setup.
 
