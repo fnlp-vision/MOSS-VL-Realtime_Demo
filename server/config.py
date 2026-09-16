@@ -406,11 +406,13 @@ class Settings:
     rep_penalty_exempt: bool = field(default_factory=lambda: _env_flag("GEN_REP_PENALTY_EXEMPT", True))
     max_new_tokens: int = field(default_factory=lambda: _env_int("GEN_MAX_NEW_TOKENS", 4096))
     # max_tokens_per_turn is a tokens-per-SECOND pacing knob in real_time_generate
-    # (wait = 1/N - cost). Unthrottled (86400) the model free-runs narration
-    # rounds, starving ASR/prefill on a single shared GPU and ballooning the KV.
-    # 4 tok/s keeps long sessions light on KV/ASR starvation; per-session override
-    # rides GenerationParams.max_tokens_per_turn (frontend streaming panel).
-    max_tokens_per_turn: int = field(default_factory=lambda: _env_int("GEN_MAX_TOKENS_PER_TURN", 4))
+    # (wait = 1/N - cost). It is now UNCAPPED by default (86400 = no pacing):
+    # the frontend owns display pacing, and capping generation only starved the
+    # (TPS-bound) TTS of input text. A throttle remains available for shared-GPU
+    # debugging — a low cap free-runs fewer narration rounds and keeps KV smaller,
+    # at the cost of slower replies and longer TTFA. Per-session override rides
+    # GenerationParams.max_tokens_per_turn; the old UI default was 4.
+    max_tokens_per_turn: int = field(default_factory=lambda: _env_int("GEN_MAX_TOKENS_PER_TURN", 86400))
     frame_queue_size: int = field(default_factory=lambda: _env_int("FRAME_QUEUE_SIZE", 256))
     system_prompt: Optional[str] = field(default_factory=lambda: os.getenv("REALTIME_SYSTEM_PROMPT"))
     initial_prompt: str = field(default_factory=lambda: _env("REALTIME_INITIAL_PROMPT", ""))

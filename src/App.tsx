@@ -20,6 +20,7 @@ import {
   Code,
   Question,
   Paperclip,
+  ListBullets,
   Microphone,
   PaperPlaneTilt,
   MicrophoneSlash,
@@ -2242,7 +2243,7 @@ export default function App() {
             temperature: parseParam(temperature, 0, 2, 0.7), // creation-time sampling
             topP: parseParam(topP, 0, 1, 0.8),
             topK: Math.round(parseParam(topK, 1, 100, 20)),
-            maxTokensPerTurn: Math.round(parseParam(maxTokensRate, 1, 500, 4)), // tokens/s rate cap
+            maxTokensPerTurn: Math.round(parseParam(maxTokensRate, 1, 500, 4)), // display reveal pace only — generation is uncapped server-side
           },
           initialClock: mediaFile?.kind === 'video' ? 'media' : 'live', // a still image sits on the live clock
         });
@@ -5142,18 +5143,54 @@ export default function App() {
                     panel's centerpiece: it takes all remaining height */}
                 <div className="log-title-row">
                   <span className="log-title">{language === 'en' ? 'Session Transcript' : '会话实时转写日志'}</span>
-                  {liveMediaTime !== null && (
-                    /* glassy tag: how long THIS SESSION has lasted (wall clock
-                       from connect) — independent of the media source; frozen
-                       at the last tick once the session ends */
-                    <span
-                      className="media-time-tag"
-                      title={language === 'en' ? 'session time' : '会话时长'}
+                  <div className="log-title-actions">
+                    {/* Context commands (/compact, /clear) ride the session
+                        socket as plain text.input — the server owns the
+                        reseat and busy-locks other events while one runs, so
+                        both buttons stay disabled until it's done. The
+                        running/completed/failed report lands in the log
+                        itself via context.command → onMemoryNotice. */}
+                    <button
+                      type="button"
+                      className={`context-cmd-btn${session.contextCommand === '/compact' ? ' running' : ''}`}
+                      disabled={!streamConnected || session.contextCommand !== null}
+                      onClick={() => session.sendText('/compact')}
+                      title={language === 'en'
+                        ? 'Summarize & compact the context (/compact)'
+                        : '总结并压缩上下文（/compact）'}
+                      aria-label={language === 'en' ? 'Compact context' : '总结上下文'}
                     >
-                      <span className="media-time-glyph" />
-                      {formatMediaTime(liveMediaTime.s)}
-                    </span>
-                  )}
+                      {session.contextCommand === '/compact'
+                        ? <CircleNotch size={14} weight="bold" />
+                        : <ListBullets size={14} weight="bold" />}
+                    </button>
+                    <button
+                      type="button"
+                      className={`context-cmd-btn danger${session.contextCommand === '/clear' ? ' running' : ''}`}
+                      disabled={!streamConnected || session.contextCommand !== null}
+                      onClick={() => session.sendText('/clear')}
+                      title={language === 'en'
+                        ? 'Clear the context and restart (/clear)'
+                        : '清空上下文并重启会话上下文（/clear）'}
+                      aria-label={language === 'en' ? 'Clear context' : '清空上下文'}
+                    >
+                      {session.contextCommand === '/clear'
+                        ? <CircleNotch size={14} weight="bold" />
+                        : <ArrowsClockwise size={14} weight="bold" />}
+                    </button>
+                    {liveMediaTime !== null && (
+                      /* glassy tag: how long THIS SESSION has lasted (wall clock
+                         from connect) — independent of the media source; frozen
+                         at the last tick once the session ends */
+                      <span
+                        className="media-time-tag"
+                        title={language === 'en' ? 'session time' : '会话时长'}
+                      >
+                        <span className="media-time-glyph" />
+                        {formatMediaTime(liveMediaTime.s)}
+                      </span>
+                    )}
+                  </div>
                 </div>
                 <div
                   className="session-conversation-log"
@@ -5470,7 +5507,7 @@ export default function App() {
                       />
                     </div>
                     <div className="param-cell">
-                      <label>{language === 'en' ? 'Rate (tokens/s)' : '限速 tokens/s'}</label>
+                      <label>{language === 'en' ? 'Reveal speed (tokens/s)' : '显示速度 tokens/s'}</label>
                       <input
                         type="number" className="liquid-number"
                         min="1" max="500" step="1"

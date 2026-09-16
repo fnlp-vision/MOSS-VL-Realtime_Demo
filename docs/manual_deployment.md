@@ -144,7 +144,7 @@ GATEWAY_MODEL_VERSION=
 | `SGLANG_OMNI_SESSIONS_PER_REPLICA` | 与各后端 `--max-running-requests` 一致；parked 仍占 slot |
 | `SGLANG_OMNI_CONTEXT_LENGTH` | 与后端 context 一致；无 usage 能力时用于回退估计 |
 | `SGLANG_OMNI_CONTEXT_RESERVE_TOKENS` | 为在途输入预留空间；默认 4096，不是额外可用 context |
-| `GEN_MAX_TOKENS_PER_TURN` | token/秒目标，默认 4，不是每轮总输出长度 |
+| `GEN_MAX_TOKENS_PER_TURN` | token/秒限速，默认 86400（不限速，显式小值才启用调试限速），不是每轮总输出长度 |
 | `GATEWAY_MAX_FRAME_BYTES` / `WS_MAX_SIZE` | 默认 32 MiB / 64 MiB；传输上限必须大于应用上限 |
 | `GATEWAY_MODEL_VERSION` / `GATEWAY_MODEL_VERSIONS` | 版本观测标识，不代表已经实现按客户指定版本路由 |
 

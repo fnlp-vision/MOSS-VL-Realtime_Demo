@@ -203,7 +203,7 @@ def up(args):
     model = HOME / "models/vlm"
     env.update(VLM_DEPLOY="sglang_omni", MODEL_PATH=str(model), AUTOLOAD_VLM="1", OFFLINE_PROVIDER="none",
         SGLANG_OMNI_URLS=f"http://127.0.0.1:{ports['backend']}", SGLANG_OMNI_SESSIONS_PER_REPLICA="4",
-        SGLANG_OMNI_CONTEXT_LENGTH="131072", GEN_MAX_TOKENS_PER_TURN="4", WS_MAX_SIZE="67108864",
+        SGLANG_OMNI_CONTEXT_LENGTH="131072", GEN_MAX_TOKENS_PER_TURN="86400", WS_MAX_SIZE="67108864",
         ASR_ENABLED=str(int("asr" in profiles)), TTS_ENABLED=str(int("tts" in profiles)), TTS_SPAWN="0",
         MEMORY_ENABLED=str(int("memory" in profiles)), DATA_DIR=str(HOME / "data"),
         MOSS_LOG_FILE=str(HOME / "logs/backend-handler.log"), VLM_WORKER_LOG_DIR=str(HOME / "logs/workers"),

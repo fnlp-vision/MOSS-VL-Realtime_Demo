@@ -3305,6 +3305,47 @@ body.light-theme .ai-stream-box[data-focus="user"] .avatar-orb-glow {
   padding-right: 4px;
 }
 
+.session-panel .log-title-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Context-command buttons (/compact summarize, /clear restart) — small
+   glassy round action beads riding the transcript title row */
+.session-panel .context-cmd-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-button);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.session-panel .context-cmd-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.session-panel .context-cmd-btn:not(:disabled):hover {
+  color: var(--text-primary);
+  border-color: var(--text-muted);
+}
+.session-panel .context-cmd-btn.danger:not(:disabled):hover {
+  color: var(--danger, oklch(65% 0.2 25));
+  border-color: var(--danger, oklch(65% 0.2 25));
+}
+.session-panel .context-cmd-btn.running {
+  color: var(--accent-live);
+}
+.session-panel .context-cmd-btn.running svg {
+  animation: msg-action-spin 0.9s linear infinite;
+}
+
 /* Reduced transparency support block */
 @media (prefers-reduced-transparency: reduce) {
   :root {

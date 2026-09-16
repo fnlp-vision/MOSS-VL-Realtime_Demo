@@ -112,3 +112,4 @@ e2e_reply.wav
 server/adapters/tts/moss_tts_nano/sidecar/third_party/MOSS-TTS-Nano/models/
 # Portable deployment example; the real .env.deploy remains private.
 !.env.deploy.sglang-omni.example
+/.repro

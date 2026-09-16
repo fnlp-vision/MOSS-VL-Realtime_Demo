@@ -180,6 +180,13 @@ class SglangOmniSession:
         self._context_reserve_tokens = max(1, int(context_reserve_tokens))
         self._largest_extend = 512
         self._context_rollover = False
+        # Upper-bound generation rate used ONLY by the context-space estimator
+        # (frames + prompts + elapsed×rate ≤ limit). Deliberately decoupled from
+        # the actual pacing cap: when the request caps generation at N tok/s the
+        # true bound IS N; uncapped (86400) we assume the realistic ceiling of
+        # free-running decode (~64 tok/s on one H200) so the KV rollover warning
+        # still fires early enough. The backend-reported usage path above makes
+        # this moot whenever usage snapshots stream.
         self._generation_rate = 4.0
 
         self._outputs: "queue.Queue[Dict[str, Any]]" = queue.Queue()
@@ -201,7 +208,10 @@ class SglangOmniSession:
         payload = dict(payload)
         if self._usage_supported:
             payload["include_usage"] = True
-        self._generation_rate = min(512.0, float(payload.get("max_tokens_per_turn") or 4.0))
+        rate = float(payload.get("max_tokens_per_turn") or 0.0)
+        # see __init__: 86400 = "uncapped" sentinel — then 64 tok/s estimates
+        # free-running decode; an explicit small cap bounds generation exactly
+        self._generation_rate = min(512.0, rate) if rate and rate < 86400.0 else 64.0
         self._client.configure(payload, timeout_s, on_event=self._handle_event)
         for key in ("prompt", "system_prompt"):
             text = payload.get(key)

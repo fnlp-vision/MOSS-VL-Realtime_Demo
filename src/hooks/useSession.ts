@@ -43,8 +43,10 @@ export interface SessionUiConfig {
   temperature?: number;
   topP?: number;
   topK?: number;
-  /** Generation rate cap, tokens/SECOND (omni max_tokens_per_turn).
-   *  Creation-time only; undefined → server default (4). */
+  /** GENERATION-RATE-DERIVED DISPLAY PACING, tokens/SECOND read as reveal
+   *  speed. Generation itself is uncapped server-side; a positive value drips
+   *  the streamed text into captions/transcript at the configured pace.
+   *  Applied at connect; 0/absent → reveal as fast as deltas arrive. */
   maxTokensPerTurn?: number;
 }
 
@@ -117,6 +119,13 @@ const LISTEN_CLEAR_MS = 8_000;
 // tokens live while the single downstream TTS is serialized/late. This is the
 // chars/sec that reads as a "full" swell (~fast bilingual streaming). Tunable.
 const GEN_RATE_FULL = 22;
+// Display pacing (the UI "rate" knob): streamed text sits in paceBufRef and
+// drips into the caption pipeline at rate × factor chars/s (the token→char
+// factor is empirical, ~1.6 chars/token measured on bilingual narration).
+// 0/absent = reveal immediately at model pace. An audio-followed ("karaoke")
+// pacing was tried and backed out — it held/garbled captions in practice.
+const PACE_TICK_MS = 100;
+const PACE_CHARS_PER_TOKEN = 1.6;
 
 function toWireConfig(c: Partial<SessionUiConfig>): Record<string, unknown> {
   const wire: Record<string, unknown> = {};
@@ -137,7 +146,8 @@ function toWireConfig(c: Partial<SessionUiConfig>): Record<string, unknown> {
   if (c.temperature !== undefined) params.temperature = c.temperature;
   if (c.topP !== undefined) params.top_p = c.topP;
   if (c.topK !== undefined) params.top_k = c.topK;
-  if (c.maxTokensPerTurn !== undefined) params.max_tokens_per_turn = c.maxTokensPerTurn;
+  // maxTokensPerTurn is intentionally NOT on the wire: generation is uncapped
+  // server-side; the value only paces local caption/transcript reveal.
   if (Object.keys(params).length > 0) wire.params = params;
   return wire;
 }
@@ -147,6 +157,10 @@ export function useSession(callbacks: UseSessionCallbacks) {
   const [connecting, setConnecting] = useState(false);
   const [listening, setListening] = useState(false);
   const [responding, setResponding] = useState(false);
+  // The context command currently executing server-side ('/compact' |
+  // '/clear' | null). The server busy-locks other events while one runs, so
+  // the UI gates its context-command buttons on this.
+  const [contextCommand, setContextCommand] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [audioOut, setAudioOut] = useState<{ sample_rate: number; channels: number } | null>(null);
   const [metrics, setMetrics] = useState<SessionMetrics>({
@@ -174,6 +188,11 @@ export function useSession(callbacks: UseSessionCallbacks) {
   const responseIdRef = useRef<string | null>(null);
   const captionBufRef = useRef('');
   const aiSentencesRef = useRef(0); // sentences already committed for the open response
+  // --- display pacing state (generation is uncapped; pacing is reveal-only) ---
+  const paceBufRef = useRef('');
+  const paceCharsPerSRef = useRef(0); // 0 = immediate (no pacing)
+  const paceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pacePendingFinalRef = useRef(false);
   const lastEmittedAtRef = useRef<number | null>(null); // server gen time of the latest delta
   const activeRef = useRef(false);
   const connectGenerationRef = useRef(0);
@@ -202,6 +221,7 @@ export function useSession(callbacks: UseSessionCallbacks) {
     // as bubbles (the samp controller does the same on a scripted mid-stop).
     // responseId gates it — a turn response.done already flushed stays flushed.
     if (responseIdRef.current) flushAiSentences(true);
+    flushPaceBuffer();
     if (reportTimerRef.current) clearInterval(reportTimerRef.current);
     reportTimerRef.current = null;
     if (listenClearTimerRef.current) clearTimeout(listenClearTimerRef.current);
@@ -225,6 +245,8 @@ export function useSession(callbacks: UseSessionCallbacks) {
     responseIdRef.current = null;
     captionBufRef.current = '';
     aiSentencesRef.current = 0;
+    paceBufRef.current = '';
+    pacePendingFinalRef.current = false;
     lastEmittedAtRef.current = null;
     genRateRef.current = 0; // orb back to rest
     genDeltaTsRef.current = 0;
@@ -233,6 +255,7 @@ export function useSession(callbacks: UseSessionCallbacks) {
     setConnecting(false);
     setListening(false);
     setResponding(false);
+    setContextCommand(null);
   }, []);
 
   // Commit each not-yet-committed closed sentence of the reply buffer as its
@@ -256,6 +279,62 @@ export function useSession(callbacks: UseSessionCallbacks) {
     if (final) {
       const tail = buf.slice(closedLen).trim();
       if (tail) cb.current.onAiSentence(tail, emittedAt, undefined, !!closed[closed.length - 1]?.capped);
+    }
+  };
+
+  const revealFromCaptionBuf = () => {
+    // subtitle shows ONE sentence at a time; reveal keeps model pace
+    cb.current.onCaption('ai', windowedCaption(captionBufRef.current));
+    // transcript: each sentence becomes its OWN bubble the moment it
+    // closes — the log fills in step with the subtitle advancing
+    flushAiSentences(false);
+  };
+
+  const commitTurnTail = () => {
+    // turn over: commit any held-back sentence + the unterminated tail; the
+    // empty caption lets the orb rest instead of freezing on the last sentence
+    flushAiSentences(true);
+    cb.current.onCaption('ai', '');
+  };
+
+  const dripPaceBuffer = () => {
+    const budget = Math.max(1, Math.round((paceCharsPerSRef.current * PACE_TICK_MS) / 1000));
+    if (paceBufRef.current) {
+      const moved = paceBufRef.current.slice(0, budget);
+      captionBufRef.current += moved;
+      paceBufRef.current = paceBufRef.current.slice(moved.length);
+      revealFromCaptionBuf();
+    }
+    if (!paceBufRef.current) {
+      if (paceTimerRef.current) {
+        clearInterval(paceTimerRef.current);
+        paceTimerRef.current = null;
+      }
+      if (pacePendingFinalRef.current) {
+        pacePendingFinalRef.current = false;
+        commitTurnTail();
+      }
+    }
+  };
+
+  const startPaceDrip = () => {
+    if (!paceTimerRef.current) paceTimerRef.current = setInterval(dripPaceBuffer, PACE_TICK_MS);
+  };
+
+  // Barge-in / context re-seat / teardown: reveal everything still pacing —
+  // the turn is over server-side, the text must not trickle in afterwards.
+  const flushPaceBuffer = () => {
+    if (paceTimerRef.current) {
+      clearInterval(paceTimerRef.current);
+      paceTimerRef.current = null;
+    }
+    if (paceBufRef.current) {
+      captionBufRef.current += paceBufRef.current;
+      paceBufRef.current = '';
+    }
+    if (pacePendingFinalRef.current) {
+      pacePendingFinalRef.current = false;
+      commitTurnTail();
     }
   };
 
@@ -312,9 +391,13 @@ export function useSession(callbacks: UseSessionCallbacks) {
         const command = String(ev.command ?? '');
         const status = String(ev.status ?? '');
         if (status === 'running') {
+          setContextCommand(command);
           playerRef.current?.stopAll();
+          flushPaceBuffer();
           setListening(false);
           cb.current.onAsrPartial?.('');
+        } else if (status === 'completed' || status === 'failed') {
+          setContextCommand(null);
         }
         const message = status === 'completed'
           ? (command === '/clear' ? '上下文已清空' : '上下文已压缩')
@@ -338,6 +421,7 @@ export function useSession(callbacks: UseSessionCallbacks) {
       }
       case 'turn.speech_started':
         playerRef.current?.stopAll(); // duck: the user is talking over the reply
+        flushPaceBuffer();
         setListening(true);
         break;
       case 'response.created':
@@ -360,12 +444,15 @@ export function useSession(callbacks: UseSessionCallbacks) {
           genDeltaTsRef.current = nowT;
           const gapS = prevTs ? Math.min(1, Math.max(0.02, (nowT - prevTs) / 1000)) : 0.1;
           genRateRef.current = genRateRef.current * 0.6 + (delta.length / gapS) * 0.4;
-          captionBufRef.current += delta;
-          // subtitle shows ONE sentence at a time; reveal keeps model pace
-          cb.current.onCaption('ai', windowedCaption(captionBufRef.current));
-          // transcript: each sentence becomes its OWN bubble the moment it
-          // closes — the log fills in step with the subtitle advancing
-          flushAiSentences(false);
+          // display pacing: knob>0 buffers text and drips at rate×1.6 chars/s;
+          // knob 0/absent reveals immediately at model pace
+          if (paceCharsPerSRef.current > 0) {
+            paceBufRef.current += delta;
+            startPaceDrip();
+          } else {
+            captionBufRef.current += delta;
+            revealFromCaptionBuf();
+          }
         }
         break;
       case 'response.done': {
@@ -377,11 +464,13 @@ export function useSession(callbacks: UseSessionCallbacks) {
           setResponding(false);
           responseIdRef.current = null;
           if (typeof ev.gen_ended_at === 'number') lastEmittedAtRef.current = ev.gen_ended_at;
-          // turn over: commit any held-back sentence + the unterminated tail
-          flushAiSentences(true);
-          // turn boundary (the client never sees <|silence|>): empty the caption
-          // so the orb rests calm instead of freezing on the last sentence
-          cb.current.onCaption('ai', '');
+          // with display pacing on, reveal keeps dripping until the buffer
+          // drains — THEN the tail commits (see dripPaceBuffer)
+          if (paceBufRef.current) {
+            pacePendingFinalRef.current = true;
+          } else {
+            commitTurnTail();
+          }
         }
         break;
       }
@@ -433,6 +522,10 @@ export function useSession(callbacks: UseSessionCallbacks) {
       setConnecting(true);
       setError(null);
       captureModeRef.current = config.captureMode;
+      // display pacing (see toWireConfig: never sent); tokens/s → chars/s; 0 = immediate
+      paceCharsPerSRef.current = config.maxTokensPerTurn && config.maxTokensPerTurn > 0
+        ? config.maxTokensPerTurn * PACE_CHARS_PER_TOKEN
+        : 0;
       try {
         const res = await fetch(resolveApiUrl('/api/sessions'), {
           method: 'POST',
@@ -616,6 +709,7 @@ export function useSession(callbacks: UseSessionCallbacks) {
   const cancelResponse = useCallback(() => {
     socketRef.current?.sendJSON('response.cancel');
     playerRef.current?.stopAll();
+    flushPaceBuffer();
   }, []);
 
   const updateConfig = useCallback((patch: Partial<SessionUiConfig>) => {
@@ -660,6 +754,7 @@ export function useSession(callbacks: UseSessionCallbacks) {
     connecting,
     listening,
     responding,
+    contextCommand,
     error,
     metrics,
     audioOut,
