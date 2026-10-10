@@ -179,7 +179,10 @@ def install_realtime_initial_prompt_patch(model_instance: Any) -> None:
             add_generation_prompt=True,
             tokenize=True,
             return_tensors="pt",
-        ).to(model_self.device)
+        )
+        if hasattr(initial_input_ids, "input_ids"):
+            initial_input_ids = initial_input_ids.input_ids
+        initial_input_ids = initial_input_ids.to(model_self.device)
         initial_attention_mask = torch.ones_like(initial_input_ids)
         prefill_len = initial_input_ids.shape[1]
         prefill_positions = (

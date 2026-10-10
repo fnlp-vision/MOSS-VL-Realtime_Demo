@@ -187,10 +187,12 @@ class HfMossVlAdapter:
                 streaming_config.vision_seq_pad_multiple = ovr
             processor_path = self.s.mossvl_streaming_processor_path
             model = self._from_pretrained(AutoModelForCausalLM, model_path, config=streaming_config)
+            self._fix_rope_inv_freq(model)
         else:
             from transformers import AutoModelForCausalLM
             processor_path = model_path  # offline processor bundled with the ckpt (or canonical)
             model = self._from_pretrained(AutoModelForCausalLM, model_path)
+            self._fix_rope_inv_freq(model)
 
         log.info("Model loaded to CPU, moving to %s", device)
         model = model.to(device)
@@ -205,6 +207,60 @@ class HfMossVlAdapter:
         self.hf_mode = hf_mode
         self.model_config = model_config
         log.info("MOSS-VL ready on %s (mode=%s)", device, hf_mode)
+
+    @staticmethod
+    def _fix_rope_inv_freq(model: Any) -> None:
+        """Repair inv_freq if from_pretrained corrupted it.
+
+        HF's trust_remote_code loading can overwrite RoPE inv_freq buffers
+        with garbage from the state dict, producing NaN or garbage values
+        in cos/sin and propagating through every layer. Re-compute from
+        config and overwrite the buffers directly.
+        """
+        import torch
+        # Fix text RoPE
+        try:
+            rotary = getattr(getattr(getattr(model, "model", None), "language_model", None), "rotary_emb", None)
+            if rotary is not None:
+                inv_freq = getattr(rotary, "inv_freq", None)
+                # Check for NaN/Inf OR garbage values (first value must be ≈1.0)
+                needs_fix = (inv_freq is None
+                             or not torch.isfinite(inv_freq).all()
+                             or abs(inv_freq[0].item() - 1.0) > 0.01)
+                if needs_fix:
+                    cfg = rotary.config
+                    base = getattr(cfg, "rope_theta", 10000.0)
+                    head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+                    clean = 1.0 / (base ** (torch.arange(0, head_dim, 2, device="cpu").float() / head_dim))
+                    clean = clean.to(inv_freq.device if inv_freq is not None else model.device)
+                    rotary.register_buffer("inv_freq", clean, persistent=False)
+                    rotary.original_inv_freq = clean
+                    if hasattr(rotary, "_inv_freq_computed"):
+                        rotary._inv_freq_computed = clean
+                    log.warning("Repaired corrupted text RoPE inv_freq")
+        except Exception as exc:
+            log.warning("text inv_freq repair skipped: %s", exc)
+        # Fix vision RoPE
+        try:
+            vm = getattr(getattr(model, "model", None), "visual", None)
+            if vm is not None and hasattr(vm, "rotary_pos_emb"):
+                vre = vm.rotary_pos_emb
+                inv_freq = getattr(vre, "inv_freq", None)
+                # Vision inv_freq should be monotonically decreasing starting at 1.0.
+                # Garbage from state dict has random values (e.g. 9e-5, 3e-41, 0, 0, 1e27).
+                needs_fix = (inv_freq is None
+                             or not torch.isfinite(inv_freq).all()
+                             or abs(inv_freq[0].item() - 1.0) > 0.01)  # first value must be ≈1.0
+                if needs_fix:
+                    theta = 10000.0
+                    dim = inv_freq.shape[0] * 2 if inv_freq is not None else 36
+                    clean = 1.0 / (theta ** (torch.arange(0, dim, 2, device="cpu").float() / dim))
+                    vre.register_buffer("inv_freq", clean.to(inv_freq.device if inv_freq is not None else model.device), persistent=False)
+                    if hasattr(vre, "_inv_freq_clean"):
+                        vre._inv_freq_clean = clean
+                    log.warning("Repaired corrupted vision RoPE inv_freq (values were garbage)")
+        except Exception as exc:
+            log.warning("vision inv_freq repair skipped: %s", exc)
 
     def _from_pretrained(self, ModelClass, model_path: str, **extra):
         """CPU-first bf16 load with flash-attn2 -> sdpa fallback.
