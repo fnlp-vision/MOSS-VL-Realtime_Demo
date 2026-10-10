@@ -48,8 +48,16 @@ class NanoProtocolEngine:
     # ---- per-provider hook ------------------------------------------------
 
     def form_fields(self, text: str, voice: Optional[str]) -> Dict[str, Any]:
-        """Form fields for /api/generate-stream/start; subclasses extend."""
-        return {"text": text, "voice": voice or self.voice}
+        """Form fields for /api/generate-stream/start; subclasses extend.
+
+        NPU (Ascend) override: greedy TTS decode + lowered audio temperature.
+        Sampled decoding on the NPU stack intermittently produces audible
+        artifacts (isolated glitches inside an otherwise clean utterance);
+        do_sample=0 removes them. GPU deployments should keep the base
+        sampling behavior — this is only load-bearing on the NPU stack.
+        """
+        return {"text": text, "voice": voice or self.voice,
+                "do_sample": "0", "audio_temperature": "0.6"}
 
     # ---- lifecycle ---------------------------------------------------------
 

@@ -248,6 +248,7 @@ class StreamingJob:
         self.emitted_audio_seconds = 0.0
         self.lead_seconds = 0.0
         self.chunk_count = 0
+        self.dropped_chunks = 0
         self.is_closed = False
         self.final_result: Optional[Dict[str, Any]] = None
 
@@ -272,6 +273,7 @@ class StreamingJob:
                 "emitted_audio_seconds": self.emitted_audio_seconds,
                 "lead_seconds": self.lead_seconds,
                 "chunk_count": self.chunk_count,
+                "dropped_chunks": self.dropped_chunks,
                 "result": self.final_result,
             }
 
@@ -289,15 +291,34 @@ def _get_job(stream_id: str) -> Optional[StreamingJob]:
 
 
 def _put_audio(job: StreamingJob, pcm_bytes: bytes) -> None:
+    # Backpressure policy: keep the producer moving so a stalled consumer can
+    # never wedge the engine. The producer holds the runtime's global model
+    # lock for the whole generation, so an indefinite queue.put here would
+    # brick the sidecar for every session (reproduced: one background-tab
+    # stall wedged old and new instances alike). Grace: ~10s of full-queue
+    # retries; past that, drop the OLDEST buffered chunk (realtime stream —
+    # stale audio is worthless) and keep going. Healthy consumers never hit
+    # the grace path; disconnected consumers are closed by iter_audio's
+    # finally instead.
+    deadline = time.monotonic() + 10.0
     while True:
         with job.lock:
             if job.is_closed:
                 return
         try:
-            job.audio_queue.put(pcm_bytes, timeout=0.1)
+            job.audio_queue.put(pcm_bytes, timeout=0.5)
             return
         except queue.Full:
-            continue
+            pass
+        if time.monotonic() >= deadline:
+            try:
+                job.audio_queue.get_nowait()  # drop oldest
+                job.audio_queue.put_nowait(pcm_bytes)
+                with job.lock:
+                    job.dropped_chunks = getattr(job, "dropped_chunks", 0) + 1
+            except (queue.Empty, queue.Full):
+                pass
+            return
 
 
 def _run_streaming_job(
@@ -567,11 +588,22 @@ async def generate_stream_audio(stream_id: str) -> Any:
         return JSONResponse(status_code=404, content={"error": "stream not found"})
 
     def iter_audio():
-        while True:
-            item = job.audio_queue.get()
-            if item is None:
-                break
-            yield item
+        try:
+            while True:
+                item = job.audio_queue.get()
+                if item is None:
+                    break
+                yield item
+        finally:
+            # Consumer gone (client disconnect or normal EOF): close the job so
+            # the producer's _put_audio retry loop exits on its next 0.1s tick
+            # and releases the runtime's global model lock. Without this, ONE
+            # stalled/disconnected consumer bricks the sidecar forever — the
+            # producer holds the lock while blocked on a full queue no one will
+            # ever drain (reproduced: open browser tab stall → all subsequent
+            # /generate-stream requests hang).
+            with job.lock:
+                job.is_closed = True
 
     return StreamingResponse(
         iter_audio(),
